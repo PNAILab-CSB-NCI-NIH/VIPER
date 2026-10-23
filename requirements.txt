@@ -1,0 +1,10 @@
+numpy==2.2.6
+scipy==1.15.3
+scikit-image==0.25.2
+matplotlib==3.10.9
+pandas==2.3.3
+tifffile==2025.5.10
+h5py==3.14.0
+torch==2.14.0
+ipykernel
+pytest
