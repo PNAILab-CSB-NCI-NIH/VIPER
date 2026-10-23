@@ -55,7 +55,24 @@ class Settings:
     save_csv: bool = True
     save_image_matrices: bool = True
 
-def load_xyz_file(filename) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_xyz_file(filename):
+    """
+    Load a whitespace-delimited XYZ file and reshape it into a 2D grid.
+
+    Parameters
+    ----------
+    filename : str or Path
+        Path to the XYZ file.
+
+    Returns
+    -------
+    x_unique : ndarray
+        Sorted unique X coordinates.
+    y_unique : ndarray
+        Sorted unique Y coordinates.
+    image : ndarray
+        2D array of Z values on the (y, x) grid.
+    """
     filename = Path(filename)
     if not filename.exists():
         raise FileNotFoundError(f"File not found:\n{filename}")
@@ -95,7 +112,20 @@ def load_xyz_file(filename) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     return x_unique, y_unique, image
 
-def median_spacing(coords: np.ndarray) -> float:
+def median_spacing(coords):
+    """
+    Compute the median spacing between sorted, strictly increasing coordinates.
+
+    Parameters
+    ----------
+    coords : array_like
+        1D array of coordinate values.
+    
+    Returns
+    -------
+    float
+        Median spacing between consecutive coordinates.
+    """
     if len(coords) < 2:
         raise ValueError("Coordinate array must contain at least two points.")
     diffs = np.diff(coords)
@@ -104,8 +134,29 @@ def median_spacing(coords: np.ndarray) -> float:
     return float(np.median(diffs))
 
 def validate_matching_grids(
-    x_raw, y_raw, raw, x_den, y_den, den, verbose: bool = True):
-    """Check RAW and DENOISED describe the same grid. Returns common x, y."""
+    x_raw, y_raw, raw, x_den, y_den, den, verbose=True):
+    """Check that RAW and DENOISED images describe the same spatial grid.
+
+    Parameters
+    ----------
+    x_raw, y_raw : array_like
+        X and Y coordinates of the RAW grid.
+    raw : ndarray
+        RAW 2D image.
+    x_den, y_den : array_like
+        X and Y coordinates of the DENOISED grid.
+    den : ndarray
+        DENOISED 2D image.
+    verbose : bool, optional
+        If True, print grid diagnostics, by default True.
+    
+    Returns
+    -------
+    x : ndarray
+        Common X coordinates.
+    y : ndarray
+        Common Y coordinates.
+    """
     if verbose:
         print("\nRAW grid")
         print(f"  size   : {len(x_raw)} x {len(y_raw)}")
@@ -150,11 +201,51 @@ def validate_matching_grids(
 
     return x_raw, y_raw 
 
-def hann_window_2d(shape: Tuple[int, int]) -> np.ndarray:
+def hann_window_2d(shape):
+    """
+    Construct a 2D Hann window from the outer product of two 1D windows.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Shape (ny, nx) of the desired window.
+    
+    Returns
+    -------
+    ndarray
+        2D Hann window of the given shape.
+    """
     ny, nx = shape
     return np.outer(np.hanning(ny), np.hanning(nx))
 
 def compute_fft_power(image, dx_nm, dy_nm, remove_mean=True, use_hann=True):
+    """
+    Compute the 2D FFT power spectrum of an image, with optional preprocessing.
+
+    Parameters
+    ----------
+    image : ndarray
+        Input 2D image.
+    dx_nm : float
+        Pixel spacing along X, in nanometers.
+    dy_nm : float
+        Pixel spacing along Y, in nanometers.
+    remove_mean : bool, optional
+        If True, subtract the mean before transforming, by default True.
+    use_hann : bool, optional
+        If True, apply a 2D Hann window before transforming, by default True.
+
+    Returns
+    -------
+    fft : ndarray
+        Shifted complex FFT of the preprocessed image.
+    power : ndarray
+        FFT power spectrum (squared magnitude).
+    qx : ndarray
+        Spatial frequency coordinates along X.
+    qy : ndarray
+        Spatial frequency coordinates along Y.
+    """
     work = np.asarray(image, dtype=float).copy()
 
     if remove_mean:
@@ -172,6 +263,21 @@ def compute_fft_power(image, dx_nm, dy_nm, remove_mean=True, use_hann=True):
     return fft, power, qx, qy
 
 def power_to_db(power, floor_db=-80.0):
+    """
+    Convert a power spectrum to a floored decibel scale, normalized to its peak.
+
+    Parameters
+    ----------
+    power : ndarray
+        Input power spectrum.
+    floor_db : float, optional
+        Minimum dB value to clip to, by default -80.0.
+    
+    Returns
+    -------
+    ndarray
+        Power spectrum in dB, floored at floor_db.
+    """
     p = np.asarray(power, dtype=float)
     pmax = np.nanmax(p)
     if pmax <= 0:
@@ -180,6 +286,35 @@ def power_to_db(power, floor_db=-80.0):
     return np.maximum(db, floor_db)
 
 def radial_average(power, qx, qy, n_bins=120, q_min=0.0, q_max=None):
+    """
+    Compute the radially averaged power spectrum over spatial frequency bins.
+
+    Parameters
+    ----------
+    power : ndarray
+        2D power spectrum.
+    qx : ndarray
+        Spatial frequency coordinates along X.
+    qy : ndarray
+        Spatial frequency coordinates along Y.
+    n_bins : int, optional
+        Number of radial bins, by default 120.
+    q_min : float, optional
+        Minimum spatial frequency to include, by default 0.0.
+    q_max : float, optional
+        Maximum spatial frequency to include. Defaults to the maximum available.
+
+    Returns
+    -------
+    q : ndarray
+        Mean spatial frequency per bin.
+    p_mean : ndarray
+        Mean power per bin.
+    p_std : ndarray
+        Standard deviation of power per bin.
+    counts : ndarray
+        Number of pixels averaged per bin.
+    """
     qx_grid, qy_grid = np.meshgrid(qx, qy)
     q = np.sqrt(qx_grid ** 2 + qy_grid ** 2)
 
@@ -212,12 +347,40 @@ def radial_average(power, qx, qy, n_bins=120, q_min=0.0, q_max=None):
             np.asarray(p_std), np.asarray(counts, dtype=int))
 
 def save_xyz(filename, x, y, image):
+    """
+    Save a 2D image and its coordinate grid to a whitespace-delimited XYZ file.
+
+    Parameters
+    ----------
+    filename : str or Path
+        Output file path.
+    x : array_like
+        X coordinates.
+    y : array_like
+        Y coordinates.
+    image : ndarray
+        2D array of Z values on the (y, x) grid.
+    """
     xx, yy = np.meshgrid(x, y)
     out = np.column_stack([xx.ravel(), yy.ravel(), image.ravel()])
     np.savetxt(filename, out, fmt="%.9f %.9f %.12g", header="X Y Z", comments="")
 
 class AFMComparison:
     def __init__(self, raw_file, denoised_file, output_dir="afm_comparison_results", **settings):
+        """
+        Initialize a RAW vs. DENOISED AFM image comparison.
+
+        Parameters
+        ----------
+        raw_file : str or Path
+            Path to the RAW XYZ file.
+        denoised_file : str or Path
+            Path to the DENOISED XYZ file.
+        output_dir : str or Path, optional
+            Directory for saved outputs, by default "afm_comparison_results".
+        **settings
+            Keyword overrides for Settings fields.
+        """
         self.raw_file = Path(raw_file)
         self.denoised_file = Path(denoised_file)
         self.output_dir = Path(output_dir)
@@ -244,7 +407,20 @@ class AFMComparison:
         self._residual_limit = None
         self._fft_limits = None
 
-    def load(self, verbose: bool = True) -> "AFMComparison":
+    def load(self, verbose=True):
+        """
+        Load and validate the RAW and DENOISED images, and compute their residual.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            If True, print grid diagnostics, by default True.
+        
+        Returns
+        -------
+        AFMComparison
+            Self, with x, y, raw, den, residual, dx, dy populated.
+        """
         x_raw, y_raw, raw = load_xyz_file(self.raw_file)
         x_den, y_den, den = load_xyz_file(self.denoised_file)
 
@@ -259,7 +435,15 @@ class AFMComparison:
             print("\nResidual computed as RAW - DENOISED (point-by-point, no interpolation).")
         return self
 
-    def run_fft(self) -> "AFMComparison":
+    def run_fft(self):
+        """
+        Compute FFT power spectra and radially averaged spectra for both images.
+
+        Returns
+        -------
+        AFMComparison
+            Self, with power_raw, power_den, qx, qy, radial_raw, radial_den populated.
+        """
         self._ensure_loaded()
         s = self.settings
 
@@ -282,7 +466,16 @@ class AFMComparison:
         )
         return self
 
-    def compute_metrics(self) -> Dict[str, Any]:
+    def compute_metrics(self):
+        """
+        Compute summary statistics and similarity metrics between RAW and DENOISED images.
+
+        Returns
+        -------
+        dict
+            Dictionary of computed metrics, including means, standard deviations,
+            residual RMS, pixel correlation, high-frequency power, and grid info.
+        """
         self._ensure_loaded()
         if self.radial_raw is None:
             self.run_fft()
@@ -323,7 +516,15 @@ class AFMComparison:
         }
         return self.metrics
 
-    def plot_real_space(self) -> plt.Figure:
+    def plot_real_space(self):
+        """
+        Plot RAW, DENOISED, and residual images side by side in real space.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            Figure containing the three real-space panels.
+        """
         self._ensure_loaded()
         s = self.settings
         x, y, raw, den, residual = self.x, self.y, self.raw, self.den, self.residual
@@ -359,7 +560,15 @@ class AFMComparison:
         self.figures["real_space"] = fig
         return fig
 
-    def plot_fft(self) -> plt.Figure:
+    def plot_fft(self):
+        """
+        Plot the FFT power spectra (in dB) of the RAW and DENOISED images side by side.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            Figure containing the two FFT panels.
+        """
         if self.power_raw is None:
             self.run_fft()
         s = self.settings
@@ -398,7 +607,17 @@ class AFMComparison:
         self.figures["fft"] = fig
         return fig
 
-    def plot_radial_spectrum(self) -> Tuple[plt.Figure, Optional[plt.Figure]]:
+    def plot_radial_spectrum(self):
+        """
+        Plot the radially averaged power spectra for RAW and DENOISED images.
+        
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure with the (optionally log-scaled) radial power spectrum.
+        fig_norm : matplotlib.figure.Figure or None
+            Figure with the normalized radial power spectrum, if enabled.
+        """
         if self.radial_raw is None:
             self.run_fft()
         s = self.settings
@@ -441,6 +660,14 @@ class AFMComparison:
         return fig, fig_norm
 
     def plot_all(self):
+        """
+        Generate all comparison plots (real space, FFT, radial spectrum).
+        
+        Returns
+        -------
+        dict
+            Dictionary of generated matplotlib figures, keyed by plot name.
+        """
         self.plot_real_space()
         self.plot_fft()
         self.plot_radial_spectrum()
@@ -449,6 +676,7 @@ class AFMComparison:
         return self.figures
 
     def save_all(self):
+        """Save all computed results (residual, spectra, matrices, metrics, summary) to disk."""
         self._ensure_loaded()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         s = self.settings
@@ -491,7 +719,15 @@ class AFMComparison:
         self._write_summary(residual_path)
         print(f"All results saved to: {self.output_dir.resolve()}")
 
-    def _write_summary(self, residual_path: Path):
+    def _write_summary(self, residual_path):
+        """
+        Write a human-readable text summary of the comparison to disk.
+
+        Parameters
+        ----------
+        residual_path : str or Path
+            Path to the saved residual XYZ file, referenced in the summary.
+        """
         summary_file = self.output_dir / "analysis_summary.txt"
         with open(summary_file, "w", encoding="utf-8") as f:
             f.write("RAW vs DENOISED AFM / XYZ comparison\n")
@@ -511,7 +747,20 @@ class AFMComparison:
                 f.write(f"FFT common dB limits: {self._fft_limits}\n")
             f.write(f"Residual file: {residual_path}\n")
 
-    def run_all(self, verbose: bool = True):
+    def run_all(self, verbose=True):
+        """
+        Run the full comparison pipeline: load, FFT, plotting, metrics, and saving.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            If True, print grid diagnostics and final metrics, by default True.
+        
+        Returns
+        -------
+        AFMComparison
+            Self, with all attributes populated.
+        """
         self.load(verbose=verbose)
         self.run_fft()
         self.plot_real_space()
@@ -528,10 +777,19 @@ class AFMComparison:
         return self
 
     def _ensure_loaded(self):
+        """Verify that the RAW and DENOISED images have been loaded."""
         if self.raw is None:
             raise RuntimeError("Call .load() first (or .run_all()).")
 
     def _get_real_limits(self):
+        """
+        Determine common color-scale limits for the real-space RAW/DENOISED plots.
+
+        Returns
+        -------
+        tuple of float
+            (vmin, vmax) color limits.
+        """
         s = self.settings
         if s.real_vmin is not None and s.real_vmax is not None:
             self._real_limits = (float(s.real_vmin), float(s.real_vmax))
@@ -545,6 +803,14 @@ class AFMComparison:
         return self._real_limits
 
     def _get_residual_limit(self):
+        """
+        Determine the symmetric color-scale limit for the residual plot.
+
+        Returns
+        -------
+        float
+            Absolute value defining the symmetric residual color limit.
+        """
         s = self.settings
         if s.residual_vlim is not None:
             self._residual_limit = float(abs(s.residual_vlim))
@@ -556,7 +822,19 @@ class AFMComparison:
         return limit
 
     def _save_figure(self, fig, name):
+        """
+        Save a figure to the output directory if figure saving is enabled.
+
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure
+            Figure to save.
+        name : str
+            Base filename (without extension) for the saved figure.
+        """
         if self.settings.save_figures:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            fig.savefig(self.output_dir / f"{name}.{self.settings.figure_format}",
-                        dpi=self.settings.dpi, bbox_inches="tight")
+            fig.savefig(
+                self.output_dir / f"{name}.{self.settings.figure_format}",
+                dpi=self.settings.dpi, bbox_inches="tight"
+            )

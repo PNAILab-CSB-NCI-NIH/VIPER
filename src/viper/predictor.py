@@ -10,6 +10,22 @@ from afm import AFMImage
 
 class Predictor:
     def __init__(self, arch, crop_size, channels=1, device="cpu", **model_kwargs):
+        """
+        Initialize a Predictor with a registered denoising model architecture.
+
+        Parameters
+        ----------
+        arch : str
+            Model architecture name, must be a key in MODEL_REGISTRY.
+        crop_size : int
+            Spatial size of the square patches the model operates on.
+        channels : int, optional
+            Number of input channels, by default 1.
+        device : str, optional
+            Device to run the model on, by default "cpu".
+        **model_kwargs
+            Additional keyword arguments passed to the model constructor.
+            """
         if arch not in MODEL_REGISTRY:
             raise ValueError(f"Unknown arch '{arch}'. Options: {list(MODEL_REGISTRY)}")
 
@@ -27,6 +43,19 @@ class Predictor:
         self.model.eval()
         
     def load(self, path, map_location=None, output=None):
+        """
+        Load model weights and normalization statistics from a checkpoint file.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the checkpoint file.
+        map_location : str or torch.device, optional
+            Device mapping for loading the checkpoint. Defaults to self.device.
+        output : str, optional
+            Output directory for denoised results. Defaults to a "denoised"
+            subfolder next to the checkpoint.
+        """
         self.output = output if output else Path(path).parent.name + "/denoised"
         if not os.path.exists(self.output):
             os.makedirs(self.output, exist_ok=True)
@@ -50,6 +79,21 @@ class Predictor:
     
     @staticmethod
     def _make_weight_map(size, sharpness=8.0):
+        """
+        Construct a 2D sigmoid-based weight map that peaks at the center and tapers toward the edges.
+
+        Parameters
+        ----------
+        size : int
+            Side length of the square weight map.
+        sharpness : float, optional
+            Steepness of the sigmoid falloff, by default 8.0.
+        
+        Returns
+        -------
+        ndarray
+            2D weight map of shape (size, size), normalized to a peak of 1.
+        """
         coords = np.linspace(-1, 1, size)
         # sigmoid-based bump: 1 at center, ~0 at edges
         bump_1d = 1.0/(1.0 + np.exp(sharpness * (np.abs(coords) - 0.5)))
@@ -59,6 +103,25 @@ class Predictor:
         return weight_2d.astype(np.float32)
 
     def predict_image(self, image, stride=None, batch_size=32, sharpness=8.0):
+        """
+        Denoise a full image by predicting over overlapping patches and blending the results.
+
+        Parameters
+        ----------
+        image : array_like
+            Input 2D image to denoise.
+        stride : int, optional
+            Step size between patches. Defaults to half the crop size.
+        batch_size : int, optional
+            Number of patches to process per model forward pass, by default 32.
+        sharpness : float, optional
+            Sharpness of the patch-blending weight map, by default 8.0.
+
+        Returns
+        -------
+        ndarray
+            Denoised image of the same shape as the input.
+        """
         if torch.is_tensor(image):
             image = image.cpu().numpy()
         image = np.asarray(image, dtype=np.float32)
@@ -109,10 +172,23 @@ class Predictor:
                 accum[y:y + cs, x:x + cs] += pred*weight_map
                 weight_sum[y:y + cs, x:x + cs] += weight_map
 
-        denoised = accum / np.clip(weight_sum, 1e-8, None)
+        denoised = accum/np.clip(weight_sum, 1e-8, None)
         return denoised.astype(np.float32)
 
     def _np(self, x):
+        """
+        Convert a tensor or array-like input to a NumPy array.
+
+        Parameters
+        ----------
+        x : torch.Tensor or array_like
+            Input data.
+        
+        Returns
+        -------
+        ndarray
+            NumPy array representation of x.
+        """
         if torch.is_tensor(x):
             return x.cpu().numpy()
         return np.asarray(x)
@@ -120,6 +196,34 @@ class Predictor:
     def compare(
             self, trace, retrace, prediction, cmap="afmhot",
             figsize=(15, 5), pred_max=True, output=None):
+        """
+        Plot trace, retrace, prediction, and prediction-minus-trace difference side by side.
+        
+        Parameters
+        ----------
+        trace : array_like
+            Input (trace) image.
+        retrace : array_like
+            Reference (retrace) image.
+        prediction : array_like
+            Denoised prediction image.
+        cmap : str, optional
+            Colormap for the image panels, by default "afmhot".
+        figsize : tuple of float, optional
+            Figure size, by default (15, 5).
+        pred_max : bool, optional
+            If True, scale color limits to the prediction's min/max, by default True.
+        output : str, optional
+            Filename (or path) to save the figure to. If only a filename is given,
+            it is saved under self.output.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The created figure.
+        ax : ndarray of matplotlib.axes.Axes
+            The four plot axes.
+        """
         trace      = self._np(trace).squeeze()
         retrace    = self._np(retrace).squeeze()
         prediction = self._np(prediction).squeeze()
@@ -162,6 +266,18 @@ class Predictor:
         return fig, ax
 
     def write_image(self, pred, apix, name):
+        """
+        Write a denoised prediction to an XYZ file.
+
+        Parameters
+        ----------
+        pred : array_like
+            Denoised 2D image to write.
+        apix : float
+            Pixel size to use for the output coordinates.
+        name : str
+            Output filename. If only a filename is given, it is saved under self.output.
+        """
         if len(name.split("/")) == 1:
             name = self.output + "/" + name
         img = AFMImage()
