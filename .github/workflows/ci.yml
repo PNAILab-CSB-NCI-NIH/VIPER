@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: viper
+          python-version: "3.11"
+          auto-activate-base: false
+
+      - name: Install VIPER
+        run: |
+          python --version
+          python -m pip install -e .
+          python -m pip check
+
+      - name: Verify installation
+        run: python -c "import viper"
+    
+      - name: Run Pytest
+        shell: bash -l {0}
+        run: |
+          pytest tests/
+    

@@ -1,0 +1,49 @@
+# Compiled
+**/__pycache__/
+
+# Temporary
+.tmp/
+*.tmp
+*.bak
+*.swp
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Distribution
+.Python
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+.ipynb_checkpoints/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache
+
+# Additional
+**/.DS_Store
+
+# Development or intermediate files
+figures
+outputs
+output
+/*.pt
+/*.png
+/*.pdf
+/*.tif
+/*.tiff
+/*.txt
+/*.json
