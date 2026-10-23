@@ -87,13 +87,13 @@ If VIPER helped your research, please cite:
 
 Zenodo:
 ```bibtex
-@software{viper,
-  author       = {},
-  title        = {},
-  year         = {},
-  publisher    = {},
-  doi          = {},
-  url          = {}
+@software{viper2026,
+  author       = {Degenhardt, Hermann F. and Li, Erin, and Rodgers, Susan and Wang, Yun-Xing and Degenhardt, Maximilia F. S.},
+  title        = {{VIPER: Early-stopping regularization for self-supervised denoising of paired images}},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.23598206},
+  url          = {https://doi.org/10.5281/zenodo.23598206}
 }
 ```
 
