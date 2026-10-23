@@ -11,6 +11,24 @@ import matplotlib.pyplot as plt
 
 class AFMPairDataset(torch.utils.data.Dataset):
     def __init__(self, x_cuts, y_cuts, mx_cuts=None, my_cuts=None, augment=True):
+        """
+        PyTorch Dataset pairing two-direction AFM image crops,
+        with optional masks and optional dihedral-group data augmentation.
+
+        Parameters
+        ----------
+        x_cuts : torch.Tensor
+            Input image crops, shape (N, C, H, W).
+        y_cuts : torch.Tensor
+            Target image crops, shape (N, C, H, W), paired with `x_cuts`.
+        mx_cuts : torch.Tensor or None, optional
+            Mask crops corresponding to `x_cuts`, by default None.
+        my_cuts : torch.Tensor or None, optional
+            Mask crops corresponding to `y_cuts`, by default None.
+        augment : bool, optional
+            If True, apply a randomly chosen flip/rotation to each sample (and
+            its masks, if present) on retrieval, by default True.
+        """
         assert x_cuts.shape[0] == y_cuts.shape[0]
         if mx_cuts is not None:
             assert mx_cuts.shape[0] == x_cuts.shape[0]
@@ -27,10 +45,32 @@ class AFMPairDataset(torch.utils.data.Dataset):
         self._ops = [0, 1, 2, 3]
 
     def __len__(self):
+        """
+        Returns
+        -------
+        int
+            Number of samples in the dataset.
+        """
         return self.x_cuts.shape[0]
 
     @staticmethod
     def _apply_transform(img, op):
+        """
+        Apply one of a fixed set of dihedral transforms to an image tensor.
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            Image tensor of shape (C, H, W).
+        op : int
+            Transform code: 0 for identity, 1 for horizontal flip, 2 for
+            vertical flip, 3 for 180-degree rotation.
+
+        Returns
+        -------
+        torch.Tensor
+            Transformed image tensor of the same shape as `img`.
+        """
         # img shape is (C, H, W)
         if op == 1: # horizontal flip (width)
             return torch.flip(img, dims=(-1,))           
@@ -41,6 +81,21 @@ class AFMPairDataset(torch.utils.data.Dataset):
         return img  # identity
 
     def __getitem__(self, idx):
+        """
+        Retrieve a (possibly augmented) sample from the dataset.
+
+        Parameters
+        ----------
+        idx : int
+            Index of the sample to retrieve.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            `(x, y)` if no masks are present, otherwise `(x, y, mx, my)`,
+            with the same random transform applied to all tensors in the
+            tuple when augmentation is enabled.
+        """
         x = self.x_cuts[idx]
         y = self.y_cuts[idx]
 
@@ -62,6 +117,24 @@ class AFMPairDataset(torch.utils.data.Dataset):
 
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=3, activation="relu", double=False):
+        """
+        A small convolutional block of one or two Conv2d + activation layers
+        with "same" padding.
+
+        Parameters
+        ----------
+        in_ch : int
+            Number of input channels.
+        out_ch : int
+            Number of output channels.
+        kernel_size : int, optional
+            Convolution kernel size, by default 3.
+        activation : {"relu", "leaky_relu"}, optional
+            Activation function to use, by default "relu".
+        double : bool, optional
+            If True, apply a second Conv2d + activation (out_ch -> out_ch)
+            after the first, by default False.
+        """
         super().__init__()
         act = {"relu": nn.ReLU, "leaky_relu": lambda: nn.LeakyReLU(0.01)}[activation]
         layers = [nn.Conv2d(in_ch, out_ch, kernel_size, padding="same"), act()]
@@ -70,10 +143,43 @@ class ConvBlock(nn.Module):
         self.block = nn.Sequential(*layers)
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, in_ch, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape (B, out_ch, H, W).
+        """
         return self.block(x)
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch, activation="relu", kernel_size=3, stride=2):
+        """
+        U-Net style decoder block: transposed-convolution upsampling followed
+        by concatenation with a skip connection and a double convolution.
+
+        Parameters
+        ----------
+        in_ch : int
+            Number of input channels (from the previous decoder stage or
+            bottleneck).
+        skip_ch : int
+            Number of channels in the skip connection to concatenate.
+        out_ch : int
+            Number of output channels after upsampling and after the final
+            convolution.
+        activation : {"relu", "leaky_relu"}, optional
+            Activation function to use, by default "relu".
+        kernel_size : int, optional
+            Kernel size of the transposed convolution, by default 3.
+        stride : int, optional
+            Stride (upsampling factor) of the transposed convolution, by
+            default 2.
+        """
         super().__init__()
         self.up = nn.ConvTranspose2d(
             in_ch, out_ch, kernel_size=kernel_size, stride=stride,
@@ -82,6 +188,22 @@ class DecoderBlock(nn.Module):
             out_ch + skip_ch, out_ch, activation=activation, double=True)
 
     def forward(self, x, skip):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input feature map to be upsampled, shape (B, in_ch, H, W).
+        skip : torch.Tensor
+            Skip-connection feature map to concatenate after upsampling,
+            shape (B, skip_ch, H', W').
+
+        Returns
+        -------
+        torch.Tensor
+            Output feature map of shape (B, out_ch, H', W'). If the
+            upsampled size doesn't match the skip connection's spatial
+            size, it is resized via nearest-neighbor interpolation first.
+        """
         x = self.up(x)
         if x.shape[-2:] != skip.shape[-2:]:
             x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
@@ -90,11 +212,34 @@ class DecoderBlock(nn.Module):
 
 class SelfAttention2d(nn.Module):
     def __init__(self, channels, num_heads=4):
+        """
+        Multi-head self-attention over the spatial positions of a feature map,
+        applied as a residual block with GroupNorm pre-normalization.
+
+        Parameters
+        ----------
+        channels : int
+            Number of input/output channels.
+        num_heads : int, optional
+            Number of attention heads, by default 4.
+        """
         super().__init__()
         self.norm = nn.GroupNorm(min(8, channels), channels)
         self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input feature map of shape (B, C, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output feature map of shape (B, C, H, W), equal to the input
+            plus the self-attention residual.
+        """
         b, c, h, w = x.shape
         residual = x
         x = self.norm(x)
@@ -105,6 +250,22 @@ class SelfAttention2d(nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.0):
+        """
+        Standard pre-norm Transformer encoder block with multi-head
+        self-attention and an MLP, each with a residual connection.
+
+        Parameters
+        ----------
+        dim : int
+            Token embedding dimension.
+        num_heads : int, optional
+            Number of attention heads, by default 8.
+        mlp_ratio : float, optional
+            Ratio of the MLP hidden dimension to `dim`, by default 4.0.
+        dropout : float, optional
+            Dropout probability applied in attention and the MLP, by default
+            0.0.
+        """
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn  = nn.MultiheadAttention(
@@ -117,6 +278,17 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input token sequence of shape (B, N, dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Output token sequence of shape (B, N, dim).
+        """
         a, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
         x = x + a
         x = x + self.mlp(self.norm2(x))
@@ -124,6 +296,28 @@ class TransformerBlock(nn.Module):
 
 class N2N(nn.Module):
     def __init__(self, channels=1, base_filters=48, depth=5, activation="leaky_relu", img_size=32):
+        """
+        A Noise2Noise-style encoder-decoder convolutional denoiser with
+        single-conv encoder stages, a convolutional bottleneck, and
+        transposed-convolution decoder stages with skip connections (including
+        the raw input as the final skip).
+
+        Parameters
+        ----------
+        channels : int, optional
+            Number of input/output image channels, by default 1.
+        base_filters : int, optional
+            Number of filters used in the stem and encoder/bottleneck
+            convolutions, by default 48.
+        depth : int, optional
+            Number of encoder/decoder stages requested. Automatically reduced
+            if it exceeds what `img_size` can support, by default 5.
+        activation : {"relu", "leaky_relu"}, optional
+            Activation function used throughout, by default "leaky_relu".
+        img_size : int, optional
+            Expected input image size (height/width), used only to cap
+            `depth`, by default 32.
+        """
         super().__init__()
         max_depth = max(1, int(math.log2(img_size)) - 2)
         if depth > max_depth:
@@ -161,6 +355,18 @@ class N2N(nn.Module):
         self.out_conv = nn.Conv2d(dec_filters, channels, 3, padding="same")
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, channels, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Denoised output tensor of shape (B, channels, H, W), resized to
+            match the input spatial size if needed.
+        """
         h = self.stem(x)
 
         enc_skips = []
@@ -187,6 +393,23 @@ class UNet(nn.Module):
     def __init__(
             self, channels=1, filters=(16, 32, 64, 128, 256),
             bottleneck_filters=512, activation="relu"):
+        """
+        A standard U-Net with double-convolution encoder/decoder stages,
+        max-pooling downsampling, a convolutional bottleneck, and
+        transposed-convolution upsampling with skip connections.
+
+        Parameters
+        ----------
+        channels : int, optional
+            Number of input/output image channels, by default 1.
+        filters : tuple of int, optional
+            Number of filters at each encoder stage (and, reversed, each
+            decoder stage), by default (16, 32, 64, 128, 256).
+        bottleneck_filters : int, optional
+            Number of filters in the bottleneck convolutions, by default 512.
+        activation : {"relu", "leaky_relu"}, optional
+            Activation function used throughout, by default "relu".
+        """
         super().__init__()
         self.pool = nn.MaxPool2d(2, ceil_mode=True)
 
@@ -214,6 +437,17 @@ class UNet(nn.Module):
         self.out_conv = nn.Conv2d(rev_filters[-1], channels, 3, padding="same")
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, channels, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape (B, channels, H, W).
+        """
         skips = []
         for enc in self.encoders:
             x = enc(x)
@@ -230,6 +464,32 @@ class ViTDenoiser(nn.Module):
     def __init__(
             self, img_size=32, channels=1, patch_size=4, dim=192,
             depth=6, num_heads=6, mlp_ratio=4.0, dropout=0.0):
+        """
+        A Vision Transformer-based image denoiser: splits the image into
+        non-overlapping patches, processes them with a stack of Transformer
+        blocks, and linearly projects tokens back to pixel patches.
+
+        Parameters
+        ----------
+        img_size : int, optional
+            Expected input image height and width (must be square), by default
+            32.
+        channels : int, optional
+            Number of input/output image channels, by default 1.
+        patch_size : int, optional
+            Side length of each square patch; must evenly divide `img_size`,
+            by default 4.
+        dim : int, optional
+            Token embedding dimension, by default 192.
+        depth : int, optional
+            Number of Transformer blocks, by default 6.
+        num_heads : int, optional
+            Number of attention heads per block, by default 6.
+        mlp_ratio : float, optional
+            Ratio of MLP hidden dimension to `dim`, by default 4.0.
+        dropout : float, optional
+            Dropout probability, by default 0.0.
+        """
         super().__init__()
         assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
         self.img_size = img_size
@@ -253,6 +513,19 @@ class ViTDenoiser(nn.Module):
         self.head = nn.Linear(dim, patch_dim)
 
     def _patchify(self, x):
+        """
+        Split an image batch into flattened non-overlapping patches.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, C, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Patch tokens of shape (B, grid*grid, C*patch_size*patch_size).
+        """
         b, c, h, w = x.shape
         p = self.patch_size
         x = x.unfold(2, p, p).unfold(3, p, p) # (B, C, gh, gw, p, p)
@@ -261,6 +534,21 @@ class ViTDenoiser(nn.Module):
         return x
 
     def _unpatchify(self, tokens, batch_size):
+        """
+        Reassemble flattened patch tokens back into an image batch.
+
+        Parameters
+        ----------
+        tokens : torch.Tensor
+            Patch tokens of shape (B, grid*grid, C*patch_size*patch_size).
+        batch_size : int
+            Batch size, used to reshape the tokens.
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed image tensor of shape (B, C, H, W).
+        """
         p = self.patch_size
         c = self.channels
         g = self.grid
@@ -270,6 +558,22 @@ class ViTDenoiser(nn.Module):
         return x
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, channels, img_size, img_size).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of the same shape as the input.
+
+        Raises
+        ------
+        ValueError
+            If the input spatial dimensions don't match `img_size`.
+        """
         b, c, h, w = x.shape
         if h != self.img_size or w != self.img_size:
             raise ValueError(
@@ -286,6 +590,29 @@ class AttnUNet(nn.Module):
             self, channels=1, filters=(16, 32, 64, 128, 256),
             bottleneck_filters=512, activation="relu",
             attn_heads=4, attn_from_stage=2):
+        """
+        A U-Net variant with self-attention blocks inserted at deeper
+        encoder/decoder stages and in the bottleneck.
+
+        Parameters
+        ----------
+        channels : int, optional
+            Number of input/output image channels, by default 1.
+        filters : tuple of int, optional
+            Number of filters at each encoder stage (and, reversed, each
+            decoder stage), by default (16, 32, 64, 128, 256).
+        bottleneck_filters : int, optional
+            Number of filters in the bottleneck convolution, by default 512.
+        activation : {"relu", "leaky_relu"}, optional
+            Activation function used throughout, by default "relu".
+        attn_heads : int, optional
+            Number of attention heads used in each `SelfAttention2d` block, by
+            default 4.
+        attn_from_stage : int, optional
+            Index of the shallowest encoder stage (0-indexed) at which
+            self-attention is applied; attention is also applied to decoder
+            stages at an equivalent depth from the bottleneck, by default 2.
+        """
         super().__init__()
         self.pool = nn.MaxPool2d(2, ceil_mode=True)
         self.attn_from_stage = attn_from_stage
@@ -324,6 +651,17 @@ class AttnUNet(nn.Module):
         self.out_conv = nn.Conv2d(rev_filters[-1], channels, 3, padding="same")
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, channels, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape (B, channels, H, W).
+        """
         skips = []
         for enc, attn in zip(self.encoders, self.enc_attn):
             x = enc(x)
@@ -341,14 +679,69 @@ class AttnUNet(nn.Module):
 
 class Denoiser:
     def __init__(self, name="Denoiser", device="cpu"):
+        """
+        High-level training/evaluation wrapper around the denoiser
+        architectures in `MODEL_REGISTRY`, handling dataset splitting, model
+        construction, training with masked loss, checkpointing, prediction, and
+        visualization.
+
+        Parameters
+        ----------
+        name : str, optional
+            Name used for logging and checkpoint filenames, by default
+            "Denoiser".
+        device : str, optional
+            Torch device string (e.g. "cpu" or "cuda") to run the model on, by
+            default "cpu".
+        """
         self.name = name
         self.device = torch.device(device)
         self.model = None
 
     def set_dataset(self, data):
+        """
+        Attach a dataset object providing paired AFM crops to the wrapper.
+
+        Parameters
+        ----------
+        data : object
+            Dataset object exposing `cuts_num`, `x_cuts`/`x_norm`,
+            `y_cuts`/`y_norm`, `mx_cuts`, `my_cuts`, and optionally
+            `crop_w`, `crop_h`, `channels`.
+
+        Returns
+        -------
+        None
+        """
         self.dataset = data
 
     def split(self, fractions=(0.7, 0.2, 0.1), norm=False):
+        """
+        Randomly split the attached dataset into train, train-validation,
+        and test subsets, and construct a reversed-direction (Y -> X)
+        validation set from the train-validation crops.
+
+        Parameters
+        ----------
+        fractions : tuple of float, optional
+            Approximate (train, train_val, test) fractions of the dataset,
+            by default (0.7, 0.2, 0.1). The test fraction is implied by the
+            remainder.
+        norm : bool, optional
+            If True, use the dataset's normalized arrays (`x_norm`,
+            `y_norm`) instead of the raw arrays, by default False.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Populates `self.train_X/y/MX/My`, `self.train_val_X/y/MX/My`,
+        `self.val_X/y/MX/My` (built by swapping X and Y on the
+        train-validation crops), and `self.test_X/y/MX/My`, along with the
+        corresponding id lists.
+        """
         n = self.dataset.cuts_num
         train_size, train_val_size, _ = (np.array(fractions)*n).astype(int)
         train_i, train_val_i = train_size, train_size + train_val_size
@@ -390,6 +783,47 @@ class Denoiser:
     def build_model(
             self, arch="unet", width=None, height=None, channels=None,
             lr=1e-3, loss="mse", summary=False, **model_kwargs):
+        """
+        Construct the underlying denoiser model, loss function, and
+        optimizer.
+
+        Parameters
+        ----------
+        arch : str, optional
+            Architecture name, one of the keys in `MODEL_REGISTRY`
+            ("n2n", "unet", "vit", "attn_unet", "swin"), by default "unet".
+        width : int or None, optional
+            Expected crop width. If None, inferred from the attached
+            dataset's `crop_w`, falling back to 32, by default None.
+        height : int or None, optional
+            Expected crop height. If None, inferred from the attached
+            dataset's `crop_h`, falling back to 32, by default None.
+        channels : int or None, optional
+            Number of image channels. If None, inferred from the attached
+            dataset's `channels`, falling back to 1, by default None.
+        lr : float, optional
+            Learning rate for the Adam optimizer, by default 1e-3.
+        loss : {"mse", "mae"} or callable, optional
+            Loss function to use (elementwise, reduction="none"), or a
+            custom callable, by default "mse".
+        summary : bool, optional
+            If True, print the full model architecture, by default False.
+        **model_kwargs
+            Additional keyword arguments forwarded to the model
+            constructor.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If `arch` is not a key in `MODEL_REGISTRY`.
+        AssertionError
+            If `arch` requires square crops (n2n, vit, swin) and
+            `width != height`.
+        """
         if arch not in MODEL_REGISTRY:
             raise ValueError(f"Unknown arch '{arch}'. Options: {list(MODEL_REGISTRY)}")
 
@@ -421,7 +855,20 @@ class Denoiser:
 
     @staticmethod
     def _to_nchw(x):
-        # (N, H, W) or (N, H, W, C) to (N, C, H, W)
+        """
+        Convert an array/tensor in (N, H, W) or (N, H, W, C) layout to
+        (N, C, H, W) float tensor layout.
+
+        Parameters
+        ----------
+        x : array_like or torch.Tensor
+            Input batch of images.
+
+        Returns
+        -------
+        torch.Tensor
+            Float tensor of shape (N, C, H, W).
+        """
         if not torch.is_tensor(x):
             x = torch.as_tensor(x)
         x = x.float()
@@ -432,6 +879,34 @@ class Denoiser:
         return x
 
     def _make_loader(self, X, Y, batch_size, shuffle, augment=False, MX=None, MY=None):
+        """
+        Build a DataLoader over paired input/target images and masks.
+
+        Parameters
+        ----------
+        X : array_like or torch.Tensor
+            Input images.
+        Y : array_like or torch.Tensor
+            Target images.
+        batch_size : int
+            Batch size for the DataLoader.
+        shuffle : bool
+            Whether to shuffle samples each epoch.
+        augment : bool, optional
+            If True, wrap the data in an `AFMPairDataset` with random
+            flip/rotation augmentation, by default False.
+        MX : array_like or torch.Tensor or None, optional
+            Mask corresponding to `X`. If None (together with `MY`), an
+            all-ones mask is used, by default None.
+        MY : array_like or torch.Tensor or None, optional
+            Mask corresponding to `Y`. If None (together with `MX`), an
+            all-ones mask is used, by default None.
+
+        Returns
+        -------
+        torch.utils.data.DataLoader
+            DataLoader yielding `(x, y, mx, my)` batches.
+        """
         X = self._to_nchw(X)
         Y = self._to_nchw(Y)
 
@@ -449,6 +924,17 @@ class Denoiser:
         return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
     
     def _checkpoint_payload(self):
+        """
+        Assemble the dictionary saved to a model checkpoint.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys "model_state_dict", "norm_x_min",
+            "norm_scale", and "use_affine", reflecting the current model
+            and (if `self.norm` is True) the dataset's normalization
+            parameters.
+        """
         return {
             "model_state_dict": self.model.state_dict(),
             "norm_x_min": self.dataset.norm_x_min if self.norm else 0.,
@@ -457,6 +943,28 @@ class Denoiser:
         }
 
     def load_model(self, path, map_location=None):
+        """
+        Load model weights (and, if present, normalization statistics)
+        from a checkpoint file.
+
+        Parameters
+        ----------
+        path : str
+            Path to the checkpoint file.
+        map_location : str or torch.device or None, optional
+            Device mapping passed to `torch.load`. Defaults to
+            `self.device` if None, by default None.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        If the checkpoint does not contain a "model_state_dict" key, it is
+        assumed to be a raw state dict, which is loaded directly; a warning
+        is printed that normalization statistics must be supplied manually.
+        """
         map_location = map_location or self.device
         checkpoint = torch.load(path, map_location=map_location)
 
@@ -477,6 +985,49 @@ class Denoiser:
     def train(
             self, epochs=50, batch_size=32, v=1, best_validation=True,
             patience=None, augment=False, monitor="val_loss", output="."):
+        """
+        Train the model with a masked reconstruction loss, tracking
+        training, same-direction validation, and reversed-direction
+        validation losses, with optional early stopping and checkpointing.
+
+        Parameters
+        ----------
+        epochs : int, optional
+            Maximum number of training epochs, by default 50.
+        batch_size : int, optional
+            Batch size used for training and evaluation, by default 32.
+        v : int, optional
+            Verbosity level: 0 for silent, 1 for per-epoch progress, >1 for
+            per-batch progress bars, by default 1.
+        best_validation : bool, optional
+            If True, reload the best checkpoint (by `monitor`) at the end
+            of training, by default True.
+        patience : int or None, optional
+            Number of epochs without improvement in `monitor` after which
+            training stops early. If None, no early stopping is applied, by
+            default None.
+        augment : bool, optional
+            If True, apply random flip/rotation augmentation to the
+            training set, by default False.
+        monitor : {"val_loss", "train_val_loss", "train_loss"}, optional
+            Metric used to select the best checkpoint and for early
+            stopping, by default "val_loss".
+        output : str, optional
+            Directory in which to save the best model checkpoint and
+            training history, by default ".".
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        The masked loss is computed as `loss_fn(pred, target) * (1 - mask)`,
+        averaged over all elements, so masked-out regions (mask == 1) are
+        excluded. Saves `{output}/{self.name}.pt` (best checkpoint) and
+        `{output}/history.pt` (loss history), and displays a plot of the
+        training/validation loss curves on a log scale.
+        """
         assert monitor in ("val_loss", "train_val_loss", "train_loss"), \
             "monitor must be 'val_loss' or 'train_val_loss'"
 
@@ -588,6 +1139,20 @@ class Denoiser:
         plt.show()
 
     def predict(self, x):
+        """
+        Run the model on a batch of input images.
+
+        Parameters
+        ----------
+        x : array_like or torch.Tensor
+            Input images in (N, H, W) or (N, H, W, C) layout.
+
+        Returns
+        -------
+        numpy.ndarray
+            Predicted images in (N, H, W, C) layout, also cached as
+            `self.yt`.
+        """
         self.model.eval()
         x_t = self._to_nchw(x).to(self.device)
         with torch.no_grad():
@@ -596,14 +1161,60 @@ class Denoiser:
         return self.yt
 
     def fft(self, img):
+        """
+        Compute the centered 2D FFT of an image.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            2D input image.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex-valued, zero-frequency-centered 2D FFT of `img`.
+        """
         F_ = np.fft.fft2(img)
         return np.fft.fftshift(F_)
 
     def ifft(self, img):
+        """
+        Compute the real part of the inverse 2D FFT of a centered spectrum.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            Zero-frequency-centered 2D Fourier spectrum.
+
+        Returns
+        -------
+        numpy.ndarray
+            Real-valued reconstructed 2D image.
+        """
         G = np.fft.ifftshift(img)
         return np.fft.ifft2(G).real
 
     def fft_mask(self, img, d, apix):
+        """
+        Build a circular low-pass binary mask in frequency space
+        corresponding to a real-space resolution cutoff.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            2D reference image used only for its shape.
+        d : float
+            Desired real-space resolution cutoff (same length units as
+            `apix`).
+        apix : float
+            Pixel size (length units per pixel).
+
+        Returns
+        -------
+        numpy.ndarray
+            Binary mask of the same shape as `img`, 1 inside the cutoff
+            radius and 0 outside.
+        """
         M, N = img.shape
         nyquist = N / 2
         D0 = nyquist * apix / d
@@ -612,6 +1223,23 @@ class Denoiser:
         return (D <= D0).astype(np.float32)
 
     def low_pass(self, image, d, apix):
+        """
+        Apply a circular low-pass filter to an image in Fourier space.
+
+        Parameters
+        ----------
+        image : array_like
+            Input image, optionally with a singleton channel dimension.
+        d : float
+            Desired real-space resolution cutoff.
+        apix : float
+            Pixel size (length units per pixel).
+
+        Returns
+        -------
+        numpy.ndarray
+            Low-pass filtered 2D image.
+        """
         img = np.asarray(image).copy()
         if img.ndim > 2:
             img = img.squeeze()
@@ -620,12 +1248,53 @@ class Denoiser:
         return self.ifft(F_ * mask)
     
     def _np(self, x):
+        """
+        Convert a tensor or array-like object to a NumPy array.
+
+        Parameters
+        ----------
+        x : torch.Tensor or array_like
+            Input data.
+
+        Returns
+        -------
+        numpy.ndarray
+            NumPy array view/copy of the input.
+        """
         if torch.is_tensor(x):
             return x.cpu().numpy()
         return np.asarray(x)
     
     def im_compare(self, sample_num=5, columns=4, d=15, apix=5, length=12, height=0.85):
+        """
+        Visually compare random training samples against model predictions
+        and a low-pass-filtered reference.
 
+        Parameters
+        ----------
+        sample_num : int, optional
+            Number of random training samples to display, by default 5.
+        columns : int, optional
+            Number of subplot columns per sample (input, target, prediction,
+            low-pass reference), by default 4.
+        d : float, optional
+            Resolution cutoff passed to `low_pass`, by default 15.
+        apix : float, optional
+            Pixel size passed to `low_pass`, by default 5.
+        length : float, optional
+            Figure width in inches, by default 12.
+        height : float, optional
+            Figure height in inches, by default 0.85.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Only the "Train" set is currently displayed; validation and test
+        comparisons are computed but not plotted.
+        """
         nums_train = random.sample(range(len(self.train_ids)), sample_num)
         nums_val   = random.sample(range(len(self.train_val_ids)), sample_num)
         nums_test  = random.sample(range(len(self.test_ids)), sample_num)
@@ -663,6 +1332,22 @@ class Denoiser:
                 plt.close()
 
 def window_partition(x, window_size):
+    """
+    Partition a batch of feature maps into non-overlapping square windows.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor of shape (B, H, W, C).
+    window_size : int
+        Side length of each square window; must evenly divide H and W.
+
+    Returns
+    -------
+    torch.Tensor
+        Windows of shape (B * H/window_size * W/window_size, window_size,
+        window_size, C).
+    """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
@@ -670,6 +1355,27 @@ def window_partition(x, window_size):
     return windows
 
 def window_reverse(windows, window_size, H, W):
+    """
+    Reassemble windowed feature maps back into a full batch of feature
+    maps.
+
+    Parameters
+    ----------
+    windows : torch.Tensor
+        Windowed tensor of shape (B * num_windows, window_size,
+        window_size, C), as produced by `window_partition`.
+    window_size : int
+        Side length of each square window.
+    H : int
+        Full feature map height.
+    W : int
+        Full feature map width.
+
+    Returns
+    -------
+    torch.Tensor
+        Reassembled tensor of shape (B, H, W, C).
+    """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
@@ -678,6 +1384,24 @@ def window_reverse(windows, window_size, H, W):
 
 class WindowAttention(nn.Module):
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, dropout=0.0):
+        """
+        Multi-head self-attention restricted to a local window, with a learned
+        relative positional bias (as in Swin Transformer).
+
+        Parameters
+        ----------
+        dim : int
+            Token embedding dimension.
+        window_size : int
+            Side length of the square attention window.
+        num_heads : int
+            Number of attention heads.
+        qkv_bias : bool, optional
+            Whether to include a bias term in the QKV projection, by default
+            True.
+        dropout : float, optional
+            Dropout probability applied to attention weights, by default 0.0.
+        """
         super().__init__()
         self.dim = dim
         self.window_size = window_size
@@ -706,6 +1430,22 @@ class WindowAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, attn_mask=None):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input window tokens of shape (B_, N, C), where B_ is the number
+            of windows (across the batch) and N = window_size**2.
+        attn_mask : torch.Tensor or None, optional
+            Additive attention mask of shape (num_windows, N, N) used to
+            prevent attention across shifted-window boundaries, by default
+            None.
+
+        Returns
+        -------
+        torch.Tensor
+            Output window tokens of shape (B_, N, C).
+        """
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)
@@ -732,6 +1472,32 @@ class SwinBlock(nn.Module):
     def __init__(
             self, dim, input_resolution, num_heads, window_size=4,
             shift_size=0, mlp_ratio=4.0, dropout=0.0):
+        """
+        A single Swin Transformer block: windowed (optionally shifted)
+        self-attention followed by an MLP, each with a residual connection and
+        pre-normalization.
+
+        Parameters
+        ----------
+        dim : int
+            Token embedding dimension.
+        input_resolution : tuple of int
+            Spatial resolution (H, W) of the token grid at this stage.
+        num_heads : int
+            Number of attention heads.
+        window_size : int, optional
+            Side length of the attention window. Reduced to `min(H, W)` (with
+            shifting disabled) if the input resolution is too small, by default
+            4.
+        shift_size : int, optional
+            Number of positions to cyclically shift the token grid before
+            windowing, enabling cross-window connections; 0 for no shift, by
+            default 0.
+        mlp_ratio : float, optional
+            Ratio of MLP hidden dimension to `dim`, by default 4.0.
+        dropout : float, optional
+            Dropout probability, by default 0.0.
+        """
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -769,6 +1535,17 @@ class SwinBlock(nn.Module):
             self.attn_mask = None
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input token sequence of shape (B, H*W, dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Output token sequence of shape (B, H*W, dim).
+        """
         H, W = self.input_resolution
         B, L, C = x.shape
         shortcut = x
@@ -792,11 +1569,39 @@ class SwinBlock(nn.Module):
 
 class SwinStage(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=4, mlp_ratio=4.0):
+        """
+        A pair of consecutive Swin blocks: one with regular window attention
+        and one with shifted window attention.
+
+        Parameters
+        ----------
+        dim : int
+            Token embedding dimension.
+        input_resolution : tuple of int
+            Spatial resolution (H, W) of the token grid at this stage.
+        num_heads : int
+            Number of attention heads.
+        window_size : int, optional
+            Side length of the attention window, by default 4.
+        mlp_ratio : float, optional
+            Ratio of MLP hidden dimension to `dim`, by default 4.0.
+        """
         super().__init__()
         self.block1 = SwinBlock(dim, input_resolution, num_heads, window_size, shift_size=0, mlp_ratio=mlp_ratio)
         self.block2 = SwinBlock(dim, input_resolution, num_heads, window_size, shift_size=window_size // 2, mlp_ratio=mlp_ratio)
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input token sequence of shape (B, H*W, dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Output token sequence of shape (B, H*W, dim).
+        """
         x = self.block1(x)
         x = self.block2(x)
         return x
@@ -805,6 +1610,36 @@ class SwinDenoiser(nn.Module):
     def __init__(
             self, img_size=32, channels=1, patch_size=4, dim=192,
             depth=6, num_heads=6, window_size=4, mlp_ratio=4.0, dropout=0.0):
+        """
+        A Swin Transformer-based image denoiser: splits the image into patches,
+        processes them through a stack of `SwinStage` blocks with windowed
+        attention, and linearly projects tokens back to pixel patches.
+
+        Parameters
+        ----------
+        img_size : int, optional
+            Expected input image height and width (must be square), by default
+            32.
+        channels : int, optional
+            Number of input/output image channels, by default 1.
+        patch_size : int, optional
+            Side length of each square patch; must evenly divide `img_size`, by
+            default 4.
+        dim : int, optional
+            Token embedding dimension, by default 192.
+        depth : int, optional
+            Total number of Swin blocks requested; organized into
+            `max(1, depth // 2)` two-block stages, by default 6.
+        num_heads : int, optional
+            Number of attention heads per block, by default 6.
+        window_size : int, optional
+            Side length of the attention window; should evenly divide the
+            patch grid size (or be at least as large as it), by default 4.
+        mlp_ratio : float, optional
+            Ratio of MLP hidden dimension to `dim`, by default 4.0.
+        dropout : float, optional
+            Dropout probability, by default 0.0.
+        """
         super().__init__()
         assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
         self.img_size = img_size
@@ -830,6 +1665,19 @@ class SwinDenoiser(nn.Module):
         self.head = nn.Linear(dim, patch_dim)
 
     def _patchify(self, x):
+        """
+        Split an image batch into flattened non-overlapping patches.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, C, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Patch tokens of shape (B, grid*grid, C*patch_size*patch_size).
+        """
         b, c, h, w = x.shape
         p = self.patch_size
         x = x.unfold(2, p, p).unfold(3, p, p)
@@ -838,6 +1686,21 @@ class SwinDenoiser(nn.Module):
         return x
 
     def _unpatchify(self, tokens, batch_size):
+        """
+        Reassemble flattened patch tokens back into an image batch.
+
+        Parameters
+        ----------
+        tokens : torch.Tensor
+            Patch tokens of shape (B, grid*grid, C*patch_size*patch_size).
+        batch_size : int
+            Batch size, used to reshape the tokens.
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed image tensor of shape (B, C, H, W).
+        """
         p = self.patch_size
         c = self.channels
         g = self.grid
@@ -847,6 +1710,22 @@ class SwinDenoiser(nn.Module):
         return x
 
     def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (B, channels, img_size, img_size).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of the same shape as the input.
+
+        Raises
+        ------
+        ValueError
+            If the input spatial dimensions don't match `img_size`.
+        """
         b, c, h, w = x.shape
         if h != self.img_size or w != self.img_size:
             raise ValueError(

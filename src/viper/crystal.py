@@ -92,6 +92,39 @@ class ACFPeak:
     value: float
 
 def load_grid(path: Path):
+    """
+    Load a scattered X Y Z column file and reshape it into a regular 2D grid.
+
+    Parameters
+    ----------
+    path : Path
+        Path to a whitespace/CSV-like text file with at least three columns
+        (X, Y, Z), optionally preceded by a header row.
+
+    Returns
+    -------
+    xu : numpy.ndarray
+        Sorted unique X coordinates.
+    yu : numpy.ndarray
+        Sorted unique Y coordinates.
+    img : numpy.ndarray
+        2D array of Z values reshaped to (ny, nx), row-major in Y then X.
+    dx : float
+        Mean spacing between adjacent unique X values.
+    dy : float
+        Mean spacing between adjacent unique Y values.
+    Lx : float
+        Field of view size along X (nx * dx).
+    Ly : float
+        Field of view size along Y (ny * dy).
+
+    Raises
+    ------
+    ValueError
+        If the file doesn't have at least 3 columns, the grid is incomplete
+        (nx * ny != number of rows), or X/Y values don't form a regular
+        row-wise grid.
+    """
     try:
         data = np.loadtxt(path)
     except ValueError:
@@ -122,6 +155,45 @@ def load_grid(path: Path):
     return xu, yu, img, dx, dy, nx * dx, ny * dy
 
 def apply_fov_override(xu, yu, dx, dy, shape, fov_nm):
+    """
+    Rescale grid coordinates so the field of view matches a specified value.
+
+    Parameters
+    ----------
+    xu : numpy.ndarray
+        Unique X coordinates.
+    yu : numpy.ndarray
+        Unique Y coordinates.
+    dx : float
+        Original X pixel spacing.
+    dy : float
+        Original Y pixel spacing.
+    shape : tuple of int
+        Shape of the image array as (ny, nx).
+    fov_nm : float or None
+        Desired field of view, in nm, applied uniformly to X. If None, no
+        rescaling is applied and the original FOV is returned.
+
+    Returns
+    -------
+    xu : numpy.ndarray
+        Rescaled unique X coordinates.
+    yu : numpy.ndarray
+        Rescaled unique Y coordinates.
+    dx : float
+        Rescaled X pixel spacing.
+    dy : float
+        Rescaled Y pixel spacing.
+    Lx : float
+        Rescaled field of view along X.
+    Ly : float
+        Rescaled field of view along Y.
+
+    Raises
+    ------
+    ValueError
+        If `fov_nm` is given but the X or Y coordinate range is zero.
+    """
     if fov_nm is None:
         return xu, yu, dx, dy, shape[1] * dx, shape[0] * dy
 
@@ -134,6 +206,24 @@ def apply_fov_override(xu, yu, dx, dy, shape, fov_nm):
             shape[1] * dx * sx, shape[0] * dy * sy)
 
 def robust_threshold(values, sigma_mult):
+    """
+    Compute a robust detection threshold using the median absolute deviation.
+
+    Parameters
+    ----------
+    values : array_like
+        Sample of background values used to estimate the noise level.
+    sigma_mult : float
+        Number of robust standard deviations above the median to set as the
+        threshold.
+
+    Returns
+    -------
+    float
+        Threshold value: median + sigma_mult * robust_sigma, where
+        robust_sigma falls back to the ordinary standard deviation if the
+        MAD-based estimate is zero or non-finite.
+    """
     values = np.asarray(values, dtype=float)
     med = np.median(values)
     mad = np.median(np.abs(values - med))
@@ -143,6 +233,32 @@ def robust_threshold(values, sigma_mult):
     return med + sigma_mult * sigma
 
 def detect_fft_peaks(power, exclude_radius_px, min_sep_px, threshold_sigma, max_peaks):
+    """
+    Detect local maxima in an FFT power spectrum above a robust threshold.
+
+    Parameters
+    ----------
+    power : numpy.ndarray
+        2D FFT power spectrum (shifted so DC is at the center).
+    exclude_radius_px : float
+        Radius, in pixels, around the DC component to exclude from peak
+        detection.
+    min_sep_px : float
+        Minimum allowed pixel distance between accepted peaks.
+    threshold_sigma : float
+        Number of robust standard deviations above background a pixel must
+        exceed to be considered a peak candidate.
+    max_peaks : int
+        Maximum number of peaks to return.
+
+    Returns
+    -------
+    selected : list of tuple of int
+        Selected peak locations as (py, px) pixel indices, ordered by
+        descending power.
+    threshold : float
+        The robust threshold value used for peak detection.
+    """
     ny, nx = power.shape
     cx, cy = nx // 2, ny // 2
     yy, xx = np.indices(power.shape)
@@ -166,25 +282,138 @@ def detect_fft_peaks(power, exclude_radius_px, min_sep_px, threshold_sigma, max_
     return selected, threshold
 
 def gaussian2d(coord, amp, qx0, qy0, sx, sy, offset):
+    """
+    Evaluate a 2D elliptical Gaussian function.
+
+    Parameters
+    ----------
+    coord : tuple of numpy.ndarray
+        Tuple (qx, qy) of coordinate arrays at which to evaluate the function.
+    amp : float
+        Peak amplitude above the offset.
+    qx0 : float
+        Center X coordinate of the Gaussian.
+    qy0 : float
+        Center Y coordinate of the Gaussian.
+    sx : float
+        Standard deviation along X.
+    sy : float
+        Standard deviation along Y.
+    offset : float
+        Constant background offset.
+
+    Returns
+    -------
+    numpy.ndarray
+        Gaussian values evaluated at the input coordinates.
+    """
     qx, qy = coord
     return offset + amp * np.exp(-0.5 * (((qx - qx0) / sx) ** 2 + ((qy - qy0) / sy) ** 2))
 
 def lorentzian2d(coord, amp, qx0, qy0, gx, gy, offset):
+    """
+    Evaluate a 2D elliptical Lorentzian function.
+
+    Parameters
+    ----------
+    coord : tuple of numpy.ndarray
+        Tuple (qx, qy) of coordinate arrays at which to evaluate the function.
+    amp : float
+        Peak amplitude above the offset.
+    qx0 : float
+        Center X coordinate of the Lorentzian.
+    qy0 : float
+        Center Y coordinate of the Lorentzian.
+    gx : float
+        Half-width parameter along X.
+    gy : float
+        Half-width parameter along Y.
+    offset : float
+        Constant background offset.
+
+    Returns
+    -------
+    numpy.ndarray
+        Lorentzian values evaluated at the input coordinates.
+    """
     qx, qy = coord
     denom = 1.0 + ((qx - qx0) / gx) ** 2 + ((qy - qy0) / gy) ** 2
     return offset + amp / denom
 
 def r2_score(y, yhat):
+    """
+    Compute the coefficient of determination (R²) for a fit.
+
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Observed data values.
+    yhat : numpy.ndarray
+        Model-predicted values.
+
+    Returns
+    -------
+    float
+        R² value, or NaN if the total sum of squares is zero.
+    """
     ss_res = np.sum((y - yhat) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
 def aic_score(y, yhat, npar=6):
+    """
+    Compute the Akaike Information Criterion for a least-squares fit.
+
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Observed data values.
+    yhat : numpy.ndarray
+        Model-predicted values.
+    npar : int, optional
+        Number of free parameters in the model, by default 6.
+
+    Returns
+    -------
+    float
+        AIC score, computed from the residual sum of squares. Lower values
+        indicate a better trade-off between fit quality and complexity.
+    """
     n = y.size
     rss = max(float(np.sum((y - yhat) ** 2)), np.finfo(float).tiny)
     return n * np.log(rss / n) + 2 * npar
 
 def fit_fft_peak(power, fx, fy, py, px, rank, patch_radius_px=7):
+    """
+    Fit a 2D Gaussian and Lorentzian to a local patch around an FFT peak and
+    keep whichever model has the lower AIC.
+
+    Parameters
+    ----------
+    power : numpy.ndarray
+        2D FFT power spectrum.
+    fx : numpy.ndarray
+        Frequency axis values corresponding to the columns of `power`.
+    fy : numpy.ndarray
+        Frequency axis values corresponding to the rows of `power`.
+    py : int
+        Row index (pixel) of the peak to fit.
+    px : int
+        Column index (pixel) of the peak to fit.
+    rank : int
+        Rank/index label to assign to this peak in the output.
+    patch_radius_px : int, optional
+        Half-width, in pixels, of the square patch extracted around the peak
+        for fitting, by default 7.
+
+    Returns
+    -------
+    FFTPeak
+        Dataclass containing the fitted peak location, amplitude, width,
+        correlation length, periodicity, orientation, and fit-quality
+        metrics. If both fits fail, a placeholder FFTPeak with
+        `success=False` is returned.
+    """
     ny, nx = power.shape
     r = patch_radius_px
     y0, y1 = max(0, py - r), min(ny, py + r + 1)
@@ -266,10 +495,46 @@ def fit_fft_peak(power, fx, fy, py, px, rank, patch_radius_px=7):
     )
 
 def angle_difference_180(a, b):
-    d = abs(a - b) % 180.0
+    """
+    Compute the smallest angular difference between two directions modulo
+    180 degrees (i.e. treating opposite directions as equivalent).
+
+    Parameters
+    ----------
+    a : float
+        First angle, in degrees.
+    b : float
+        Second angle, in degrees.
+
+    Returns
+    -------
+    float
+        Angular difference in degrees, in the range [0, 90].
+    """
+    d = abs(a - b)%180.0
     return min(d, 180.0 - d)
 
 def pair_fft_peaks(peaks, tolerance_q):
+    """
+    Pair FFT peaks with their +q/-q mirror counterparts to identify unique
+    physical periodicities.
+
+    Parameters
+    ----------
+    peaks : list of FFTPeak
+        Fitted FFT peaks to search for mirror pairs.
+    tolerance_q : float
+        Maximum allowed distance, in cycles/nm, between a peak and the
+        expected mirror position for them to be paired.
+
+    Returns
+    -------
+    list of dict
+        One entry per matched pair, sorted by ascending q magnitude, with
+        keys including pair id, source peak ranks, averaged q-vector
+        components, period, orientation, amplitude, delta_q, correlation
+        length, and the pairing error.
+    """
     valid = [p for p in peaks if p.success and np.isfinite(p.q)]
     used = set()
     pairs = []
@@ -309,6 +574,30 @@ def pair_fft_peaks(peaks, tolerance_q):
     return sorted(pairs, key=lambda d: d["q_nm^-1"])
 
 def harmonic_matches(pairs, max_order, ratio_tolerance, angle_tol_deg):
+    """
+    Identify pairs of periodicities whose q-magnitudes are consistent with
+    an integer harmonic relationship.
+
+    Parameters
+    ----------
+    pairs : list of dict
+        Paired FFT periodicities, as produced by `pair_fft_peaks`.
+    max_order : int
+        Highest integer harmonic order to test.
+    ratio_tolerance : float
+        Maximum allowed relative deviation from an exact integer ratio.
+    angle_tol_deg : float
+        Maximum orientation difference, in degrees, for a harmonic match to
+        be flagged as orientation-consistent.
+
+    Returns
+    -------
+    list of dict
+        One entry per candidate harmonic relationship, with keys for the
+        base and candidate pair ids, harmonic order, q ratio, relative
+        deviation, orientation difference, and an orientation-consistency
+        flag.
+    """
     rows = []
     pairs = sorted(pairs, key=lambda d: d["q_nm^-1"])
     for i, base in enumerate(pairs):
@@ -329,6 +618,24 @@ def harmonic_matches(pairs, max_order, ratio_tolerance, angle_tol_deg):
     return rows
 
 def compute_autocorrelation(img0, use_hann):
+    """
+    Compute the normalized 2D spatial autocorrelation of an image via the
+    Wiener-Khinchin theorem (FFT of the power spectrum).
+
+    Parameters
+    ----------
+    img0 : numpy.ndarray
+        Mean-subtracted 2D image.
+    use_hann : bool
+        Whether to apply a 2D Hann window before computing the FFT, to
+        reduce edge artifacts.
+
+    Returns
+    -------
+    numpy.ndarray
+        2D autocorrelation map, zero-lag-centered, normalized so the
+        zero-lag value equals 1 (unless it is exactly zero).
+    """
     work = img0.copy()
     if use_hann:
         wy = signal.windows.hann(work.shape[0], sym=False)
@@ -343,6 +650,32 @@ def compute_autocorrelation(img0, use_hann):
     return ac
 
 def refine_acf_peak(ac_smooth, py, px):
+    """
+    Refine the sub-pixel location of an autocorrelation peak by fitting a
+    local quadratic surface.
+
+    Parameters
+    ----------
+    ac_smooth : numpy.ndarray
+        Smoothed 2D autocorrelation map.
+    py : int
+        Integer row index of the peak to refine.
+    px : int
+        Integer column index of the peak to refine.
+
+    Returns
+    -------
+    px_refined : float
+        Sub-pixel refined column position.
+    py_refined : float
+        Sub-pixel refined row position.
+
+    Notes
+    -----
+    Falls back to the original integer pixel location if the peak is on the
+    array boundary, the local patch contains non-finite values, the
+    quadratic system is singular, or the computed shift exceeds one pixel.
+    """
     ny, nx = ac_smooth.shape
     if px <= 0 or px >= nx - 1 or py <= 0 or py >= ny - 1:
         return float(px), float(py)
@@ -372,6 +705,40 @@ def refine_acf_peak(ac_smooth, py, px):
 def detect_acf_peaks(
         ac, dx, dy, smooth_sigma_px, exclude_center_px,
         min_separation_px, threshold_sigma, max_peaks):
+    """
+    Detect, refine, and characterize local maxima in a 2D autocorrelation
+    map.
+
+    Parameters
+    ----------
+    ac : numpy.ndarray
+        2D autocorrelation map.
+    dx : float
+        Pixel spacing along X, in nm.
+    dy : float
+        Pixel spacing along Y, in nm.
+    smooth_sigma_px : float
+        Standard deviation, in pixels, of the Gaussian smoothing applied
+        before peak detection.
+    exclude_center_px : float
+        Radius, in pixels, around the zero-lag center excluded from peak
+        detection.
+    min_separation_px : float
+        Minimum allowed pixel distance between accepted peaks.
+    threshold_sigma : float
+        Number of standard deviations above background a pixel must exceed
+        to be considered a peak candidate.
+    max_peaks : int
+        Maximum number of peaks to return.
+
+    Returns
+    -------
+    peaks : list of ACFPeak
+        Detected peaks with sub-pixel refined lag vectors, radial distance,
+        orientation, and autocorrelation value.
+    threshold : float
+        Threshold value used for peak detection.
+    """
     smooth = ndimage.gaussian_filter(ac, smooth_sigma_px)
     ny, nx = ac.shape
     cx, cy = nx // 2, ny // 2
@@ -407,8 +774,26 @@ def detect_acf_peaks(
             value=float(ac[py, px])))
     return peaks, threshold
 
-
 def pair_acf_peaks(peaks, tolerance_nm):
+    """
+    Pair autocorrelation peaks with their opposite-lag counterparts to
+    identify unique real-space lattice vectors.
+
+    Parameters
+    ----------
+    peaks : list of ACFPeak
+        Detected autocorrelation peaks.
+    tolerance_nm : float
+        Maximum allowed distance, in nm, between a peak and the expected
+        opposite-lag position for them to be paired.
+
+    Returns
+    -------
+    list of dict
+        One entry per matched pair, with keys for pair id, source peak
+        ranks, averaged lag vector components, radial distance,
+        orientation, averaged autocorrelation value, and pairing error.
+    """
     used = set()
     pairs = []
     pair_id = 1
@@ -441,6 +826,22 @@ def pair_acf_peaks(peaks, tolerance_nm):
     return pairs
 
 def vector_angle(v1, v2):
+    """
+    Compute the angle between two 2D vectors.
+
+    Parameters
+    ----------
+    v1 : array_like
+        First vector, shape (2,).
+    v2 : array_like
+        Second vector, shape (2,).
+
+    Returns
+    -------
+    float
+        Angle between the vectors in degrees, in [0, 180]. Returns NaN if
+        either vector has zero length.
+    """
     v1, v2 = np.asarray(v1, dtype=float), np.asarray(v2, dtype=float)
     den = np.linalg.norm(v1)*np.linalg.norm(v2)
     if den <= 0:
@@ -448,12 +849,45 @@ def vector_angle(v1, v2):
     return np.degrees(np.arccos(np.clip(np.dot(v1, v2)/den, -1, 1)))
 
 def canonical_vector(v):
+    """
+    Return a canonical sign choice for a 2D vector, flipping it so that it
+    points into the right half-plane (or upward along the Y axis if on the
+    boundary).
+
+    Parameters
+    ----------
+    v : array_like
+        Input 2D vector.
+
+    Returns
+    -------
+    numpy.ndarray
+        The vector `v` or `-v`, whichever satisfies the canonical sign
+        convention.
+    """
     v = np.asarray(v, dtype=float)
     if v[0] < 0 or (abs(v[0]) < 1e-12 and v[1] < 0):
         v = -v
     return v
 
 def unique_vectors(vectors, tolerance_nm=0.15):
+    """
+    Filter a list of 2D vectors down to a set of directionally-unique
+    vectors, treating a vector and its negation as equivalent.
+
+    Parameters
+    ----------
+    vectors : list of array_like
+        Candidate 2D vectors.
+    tolerance_nm : float, optional
+        Distance, in nm, below which two vectors (or a vector and the
+        negation of another) are considered duplicates, by default 0.15.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Deduplicated vectors with length greater than `tolerance_nm`.
+    """
     unique = []
     for v in vectors:
         v = np.asarray(v, dtype=float)
@@ -466,6 +900,26 @@ def unique_vectors(vectors, tolerance_nm=0.15):
     return unique
 
 def build_candidate_basis_vectors(acf_pairs, max_vectors, n_candidates=60):
+    """
+    Build a pool of candidate real-space lattice basis vectors from the
+    strongest paired autocorrelation vectors, including pairwise sums and
+    differences.
+
+    Parameters
+    ----------
+    acf_pairs : list of dict
+        Paired autocorrelation vectors, as produced by `pair_acf_peaks`.
+    max_vectors : int
+        Number of strongest (by autocorrelation value) paired vectors to use
+        as the base set before forming combinations.
+    n_candidates : int, optional
+        Maximum number of candidate vectors to return, by default 60.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Deduplicated candidate basis vectors, sorted by ascending length.
+    """
     selected = sorted(acf_pairs, key=lambda d: d["acf_value"], reverse=True)[:max_vectors]
     base = [canonical_vector([p["dx_nm"], p["dy_nm"]]) for p in selected]
 
@@ -482,6 +936,33 @@ def build_candidate_basis_vectors(acf_pairs, max_vectors, n_candidates=60):
     return candidates[:n_candidates]
 
 def lattice_predictions(b1, b2, max_index, extent_x, extent_y):
+    """
+    Generate predicted lattice point positions from a 2D basis within a
+    bounding region.
+
+    Parameters
+    ----------
+    b1 : array_like
+        First basis vector, shape (2,).
+    b2 : array_like
+        Second basis vector, shape (2,).
+    max_index : int
+        Requested maximum integer multiple of the basis vectors to use when
+        generating lattice points (may be increased internally, up to 12, to
+        cover the requested extent).
+    extent_x : float
+        Half-width of the bounding region along X, in nm.
+    extent_y : float
+        Half-width of the bounding region along Y, in nm.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Array of shape (N, 4) with columns (m, n, x, y) for each lattice
+        point within the bounding region, where (m, n) are the integer
+        basis coefficients and (x, y) is the resulting position. Returns
+        None if the basis vectors are degenerate (near-zero determinant).
+    """
     A = np.column_stack([b1, b2])
     det = np.linalg.det(A)
     if abs(det) < 1e-10:
@@ -501,8 +982,38 @@ def lattice_predictions(b1, b2, max_index, extent_x, extent_y):
                 points.append((m, n, r[0], r[1]))
     return np.asarray(points, dtype=float)
 
-
 def nearest_lattice_residual(observed, b1, b2, tol_nm, max_lattice_index):
+    """
+    Measure how well a candidate real-space lattice basis explains a set of
+    observed autocorrelation vectors.
+
+    Parameters
+    ----------
+    observed : list of dict
+        Observed paired ACF vectors, each with 'dx_nm', 'dy_nm', and
+        'acf_value' keys.
+    b1 : array_like
+        First candidate basis vector.
+    b2 : array_like
+        Second candidate basis vector.
+    tol_nm : float
+        Maximum distance, in nm, between an observed vector and its nearest
+        predicted lattice point for it to be considered explained.
+    max_lattice_index : int
+        Maximum integer multiple of the basis vectors used when generating
+        predicted lattice points.
+
+    Returns
+    -------
+    coverage : float
+        Weighted fraction of observed vector intensity explained by the
+        candidate lattice.
+    rms : float
+        Weighted RMS residual distance, in nm, between observed vectors and
+        their nearest predicted lattice points.
+    results : list of tuple
+        Per-observation (residual_distance, within_tolerance) pairs.
+    """
     pred = lattice_predictions(b1, b2, max_lattice_index, 55, 55)
     if pred is None or len(pred) == 0:
         return 0.0, np.inf, []
@@ -526,12 +1037,57 @@ def nearest_lattice_residual(observed, b1, b2, tol_nm, max_lattice_index):
     return coverage, rms, list(zip(residuals, assignments))
 
 def reciprocal_basis_from_direct(b1, b2):
+    """
+    Compute the reciprocal lattice basis corresponding to a real-space
+    basis.
+
+    Parameters
+    ----------
+    b1 : array_like
+        First real-space basis vector.
+    b2 : array_like
+        Second real-space basis vector.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        2x2 matrix whose columns are the reciprocal basis vectors. Returns
+        None if the real-space basis is degenerate (near-zero determinant).
+    """
     A = np.column_stack([b1, b2])
     if abs(np.linalg.det(A)) < 1e-10:
         return None
     return np.linalg.inv(A).T
 
 def fft_lattice_coverage(observed_q, G, fft_match_tol_pixels):
+    """
+    Measure how well a reciprocal lattice basis explains a set of observed
+    FFT peak positions.
+
+    Parameters
+    ----------
+    observed_q : list of dict
+        Observed paired FFT periodicities, each with 'qx_nm^-1', 'qy_nm^-1',
+        'dq_grid_nm^-1', and optionally 'mean_amplitude' keys.
+    G : numpy.ndarray or None
+        2x2 reciprocal basis matrix, as produced by
+        `reciprocal_basis_from_direct`.
+    fft_match_tol_pixels : float
+        Matching tolerance, expressed in multiples of the FFT grid spacing,
+        for a predicted reciprocal lattice point to be considered a match.
+
+    Returns
+    -------
+    coverage : float
+        Weighted fraction of observed peak intensity explained by the
+        reciprocal lattice. Returns 0.0 if `G` is None or there are no
+        observations.
+    rms : float
+        Weighted RMS residual distance, in cycles/nm, between observed and
+        predicted peak positions.
+    results : list of tuple
+        Per-observation (residual_distance, within_tolerance) pairs.
+    """
     if G is None or len(observed_q) == 0:
         return 0.0, np.inf, []
 
@@ -555,7 +1111,38 @@ def fft_lattice_coverage(observed_q, G, fft_match_tol_pixels):
     rms = float(np.sqrt(np.sum(weights*residuals**2)/np.sum(weights)))
     return coverage, rms, list(zip(residuals, assignments))
 
-def evaluate_basis(b1, b2, acf_pairs, fft_pairs, dq_grid, s: Settings):
+def evaluate_basis(b1, b2, acf_pairs, fft_pairs, dq_grid, s):
+    """
+    Score a candidate real-space lattice basis against observed ACF and FFT
+    data.
+
+    Parameters
+    ----------
+    b1 : array_like
+        First candidate basis vector.
+    b2 : array_like
+        Second candidate basis vector.
+    acf_pairs : list of dict
+        Paired autocorrelation vectors used to evaluate real-space
+        coverage.
+    fft_pairs : list of dict
+        Paired FFT periodicities used to evaluate reciprocal-space coverage.
+    dq_grid : float
+        FFT frequency grid spacing, used to normalize the FFT RMS term in
+        the score.
+    s : Settings
+        Analysis settings, including basis angle limits and matching
+        tolerances.
+
+    Returns
+    -------
+    dict or None
+        Dictionary describing the evaluated basis, including the basis
+        vectors, lengths, included angle, area, ACF/FFT coverage and RMS
+        residuals, per-peak assignments, the reciprocal basis, and an
+        overall score. Returns None if the basis is degenerate or the
+        included angle falls outside the allowed range.
+    """
     b1, b2 = np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)
     l1, l2 = np.linalg.norm(b1), np.linalg.norm(b2)
     if l1 <= 0 or l2 <= 0:
@@ -592,7 +1179,34 @@ def evaluate_basis(b1, b2, acf_pairs, fft_pairs, dq_grid, s: Settings):
         "fft_assignments": fft_assign, "score": float(score),
     }
 
-def find_global_lattice(acf_pairs, fft_pairs, dq_grid, s: Settings):
+def find_global_lattice(acf_pairs, fft_pairs, dq_grid, s):
+    """
+    Search over candidate basis vector pairs to find the real-space lattice
+    basis that best explains the observed ACF and FFT data.
+
+    Parameters
+    ----------
+    acf_pairs : list of dict
+        Paired autocorrelation vectors.
+    fft_pairs : list of dict
+        Paired FFT periodicities.
+    dq_grid : float
+        FFT frequency grid spacing.
+    s : Settings
+        Analysis settings controlling candidate generation, search limits,
+        and minimum coverage thresholds.
+
+    Returns
+    -------
+    best : dict or None
+        The highest-scoring basis evaluation (as returned by
+        `evaluate_basis`), or None if no valid non-degenerate basis could be
+        found.
+    status : str
+        A human-readable status message: "ok" on success, or a description
+        of why the result should be treated cautiously or why no lattice
+        was found.
+    """
     if len(acf_pairs) < 2:
         return None, "Not enough paired autocorrelation vectors."
 
@@ -618,6 +1232,34 @@ def find_global_lattice(acf_pairs, fft_pairs, dq_grid, s: Settings):
     return best, "ok"
 
 def reduce_primitive_basis_2d(b1, b2, max_coeff=8, area_tol=0.03):
+    """
+    Reduce a 2D lattice basis to a near-shortest-vector (Minkowski-reduced)
+    representation spanning the same lattice.
+
+    Parameters
+    ----------
+    b1 : array_like
+        First basis vector of the input lattice.
+    b2 : array_like
+        Second basis vector of the input lattice.
+    max_coeff : int, optional
+        Maximum integer coefficient used when searching integer
+        combinations of `b1` and `b2` for shorter basis vectors, by default
+        8.
+    area_tol : float, optional
+        Relative tolerance on unit cell area used to confirm that a
+        candidate second vector preserves the original lattice, by default
+        0.03.
+
+    Returns
+    -------
+    v1 : numpy.ndarray
+        Canonicalized shortest lattice vector found.
+    v2 : numpy.ndarray
+        Canonicalized second basis vector, chosen as the shortest vector
+        that preserves the original unit cell area. Falls back to the
+        original basis if no reduction is found.
+    """
     b1, b2 = np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)
     primitive_area = abs(np.cross(b1, b2))
     if primitive_area <= 1e-10:
@@ -654,6 +1296,23 @@ def reduce_primitive_basis_2d(b1, b2, max_coeff=8, area_tol=0.03):
     return canonical_vector(v1), canonical_vector(best_v2)
 
 def lattice_rows(lattice):
+    """
+    Flatten a lattice result dictionary into a single row suitable for CSV
+    export.
+
+    Parameters
+    ----------
+    lattice : dict
+        Lattice result dictionary, as returned by `find_global_lattice` /
+        `evaluate_basis`.
+
+    Returns
+    -------
+    dict
+        Flat dictionary with basis vector components, lengths, angles,
+        shorter/longer vector labels, unit cell area, and ACF/FFT coverage
+        and RMS metrics.
+    """
     b1, b2 = lattice["b1"], lattice["b2"]
     short, long = sorted([b1, b2], key=np.linalg.norm)
     return {
@@ -672,6 +1331,24 @@ def lattice_rows(lattice):
     }
 
 def crystal_reference_rows(crystal_phases):
+    """
+    Convert a dictionary of crystallographic reference phases into rows of
+    derived quantities for comparison with AFM-derived lattices.
+
+    Parameters
+    ----------
+    crystal_phases : dict
+        Mapping from phase name to a dict with keys 'a_A' (a-axis length in
+        angstroms), 'c_A' (c-axis length in angstroms), and 'beta_deg'
+        (monoclinic beta angle in degrees).
+
+    Returns
+    -------
+    list of dict
+        One entry per phase, with a/c lengths converted to nm, half of c,
+        the beta angle, and corresponding reciprocal-space quantities in
+        both cycles/nm and rad/nm.
+    """
     rows = []
     for phase, vals in crystal_phases.items():
         a_nm, c_nm = vals["a_A"]/10.0, vals["c_A"]/10.0
@@ -683,6 +1360,26 @@ def crystal_reference_rows(crystal_phases):
     return rows
 
 def compare_lattice_to_crystal(lattice, refs):
+    """
+    Compare a data-driven lattice basis to crystallographic reference
+    lattice parameters under both possible axis assignments.
+
+    Parameters
+    ----------
+    lattice : dict or None
+        Data-driven lattice result, as returned by `find_global_lattice`.
+    refs : list of dict
+        Crystallographic reference rows, as returned by
+        `crystal_reference_rows`.
+
+    Returns
+    -------
+    list of dict
+        One entry per (reference phase, axis assignment) combination,
+        giving the candidate AFM lengths, crystal reference lengths,
+        percent differences, and beta angle comparison. Returns an empty
+        list if `lattice` is None.
+    """
     if lattice is None:
         return []
     v1, v2 = lattice["b1"], lattice["b2"]
@@ -705,6 +1402,27 @@ def compare_lattice_to_crystal(lattice, refs):
     return rows
 
 def radial_spectrum(power, fx, fy, nbins=180):
+    """
+    Compute the azimuthally averaged (radial) FFT power spectrum.
+
+    Parameters
+    ----------
+    power : numpy.ndarray
+        2D FFT power spectrum.
+    fx : numpy.ndarray
+        Frequency axis values corresponding to the columns of `power`.
+    fy : numpy.ndarray
+        Frequency axis values corresponding to the rows of `power`.
+    nbins : int, optional
+        Number of radial bins to use, by default 180.
+
+    Returns
+    -------
+    rq : numpy.ndarray
+        Bin-center radial spatial frequencies, in cycles/nm.
+    rp : numpy.ndarray
+        Mean power within each radial bin.
+    """
     FX, FY = np.meshgrid(fx, fy)
     qv = np.hypot(FX, FY).ravel()
     pv = power.ravel()
@@ -720,6 +1438,21 @@ def radial_spectrum(power, fx, fy, nbins=180):
     return np.asarray(rq), np.asarray(rp)
 
 def write_csv(path, rows):
+    """
+    Write a list of dictionaries to a CSV file.
+
+    Parameters
+    ----------
+    path : Path
+        Output file path.
+    rows : iterable of dict
+        Rows to write. Column names are taken from the keys of the first
+        row. If empty, an (almost) empty file is written instead.
+
+    Returns
+    -------
+    None
+    """
     rows = list(rows)
     if not rows:
         path.write_text("\n")
@@ -731,6 +1464,22 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 def write_summary(path, info):
+    """
+    Write a sectioned, human-readable text summary to file.
+
+    Parameters
+    ----------
+    path : Path
+        Output file path.
+    info : iterable of tuple
+        Sequence of (section_title, lines) pairs, where `lines` is an
+        iterable of values to be written one per line under an underlined
+        section header.
+
+    Returns
+    -------
+    None
+    """
     with path.open("w") as f:
         for section, lines in info:
             f.write(f"\n{section}\n")
@@ -740,6 +1489,26 @@ def write_summary(path, info):
 
 class AFMLatticeAnalysis:
     def __init__(self, file, output_dir="autocorr", fov_nm= None, data_label="AFM", **settings):
+        """
+        End-to-end pipeline for extracting a data-driven real-space lattice from
+        an AFM height image via FFT peak analysis and 2D autocorrelation.
+
+        Parameters
+        ----------
+        file : str or Path
+            Path to the input X Y Z grid data file.
+        output_dir : str or Path, optional
+            Directory where figures and result files are written, by default
+            "autocorr".
+        fov_nm : float or None, optional
+            If given, overrides the field of view (assumed square) by rescaling
+            the loaded coordinates, by default None.
+        data_label : str, optional
+            Label used in plot titles and legends, by default "AFM".
+        **settings
+            Keyword overrides passed to `Settings` to customize analysis
+            parameters.
+        """
         self.file = Path(file)
         self.output_dir = Path(output_dir)
         self.fov_nm = fov_nm
@@ -778,6 +1547,28 @@ class AFMLatticeAnalysis:
         self.figures: Dict[str, plt.Figure] = {}
 
     def load(self, verbose=True):
+        """
+        Load the input grid file and store the image and coordinate
+        metadata on the instance.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            If True, print a summary of the loaded grid dimensions and
+            calibration, by default True.
+
+        Returns
+        -------
+        AFMLatticeAnalysis
+            The instance itself, to allow method chaining.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the input file does not exist.
+        ValueError
+            If the loaded image contains NaN or infinite values.
+        """
         if not self.file.exists():
             raise FileNotFoundError(f"Input file not found: {self.file}")
 
@@ -797,6 +1588,21 @@ class AFMLatticeAnalysis:
         return self
 
     def run_fft(self):
+        """
+        Compute the 2D FFT power spectrum of the loaded image, detect and
+        fit peaks, pair them into unique periodicities, and search for
+        harmonic relationships.
+
+        Returns
+        -------
+        AFMLatticeAnalysis
+            The instance itself, to allow method chaining.
+
+        Raises
+        ------
+        RuntimeError
+            If called before `.load()`.
+        """
         self._ensure_loaded()
         s = self.settings
         img = self.img
@@ -836,6 +1642,20 @@ class AFMLatticeAnalysis:
         return self
 
     def run_autocorrelation(self):
+        """
+        Compute the 2D spatial autocorrelation of the loaded image, detect
+        peaks, and pair them into unique real-space lattice vectors.
+
+        Returns
+        -------
+        AFMLatticeAnalysis
+            The instance itself, to allow method chaining.
+
+        Raises
+        ------
+        RuntimeError
+            If called before `.load()`.
+        """
         self._ensure_loaded()
         s = self.settings
         img = self.img
@@ -854,6 +1674,19 @@ class AFMLatticeAnalysis:
         return self
 
     def find_lattice(self):
+        """
+        Search for the best-supported real-space lattice basis using the
+        paired ACF vectors and FFT periodicities, reducing the result to a
+        near-primitive basis.
+
+        Runs `.run_autocorrelation()` and/or `.run_fft()` first if they have
+        not already been run.
+
+        Returns
+        -------
+        AFMLatticeAnalysis
+            The instance itself, to allow method chaining.
+        """
         if not self.acf_pairs and self.ac is None:
             self.run_autocorrelation()
         if not self.paired_fft and self.power is None:
@@ -876,6 +1709,23 @@ class AFMLatticeAnalysis:
         return self
 
     def compare_to_crystal_phases(self, crystal_phases):
+        """
+        Compare the data-driven lattice basis to one or more
+        crystallographic reference phases.
+
+        Calls `.find_lattice()` first if it has not already been run.
+
+        Parameters
+        ----------
+        crystal_phases : dict
+            Mapping from phase name to a dict with keys 'a_A', 'c_A', and
+            'beta_deg' (see `crystal_reference_rows`).
+
+        Returns
+        -------
+        list of dict
+            Comparison rows, as returned by `compare_lattice_to_crystal`.
+        """
         if self.lattice is None:
             self.find_lattice()
 
@@ -885,6 +1735,21 @@ class AFMLatticeAnalysis:
         return self.crystal_comparison
 
     def _save_fig(self, fig, name):
+        """
+        Save and/or display a matplotlib figure according to the current
+        settings.
+
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure
+            Figure to save and/or display.
+        name : str
+            Filename to use when saving the figure to `output_dir`.
+
+        Returns
+        -------
+        None
+        """
         if self.settings.save_figures:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             fig.savefig(self.output_dir / name, dpi=self.settings.dpi, bbox_inches="tight")
@@ -893,6 +1758,19 @@ class AFMLatticeAnalysis:
         else: plt.close(fig)
 
     def plot_real_space(self):
+        """
+        Plot the real-space AFM height image.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure, also stored in `self.figures["real_space"]`.
+
+        Raises
+        ------
+        RuntimeError
+            If called before `.load()`.
+        """
         self._ensure_loaded()
         s = self.settings
         fig, ax = plt.subplots(figsize=(6, 5))
@@ -910,6 +1788,17 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_fft(self):
+        """
+        Plot the FFT power spectrum (log scale) with detected and paired
+        peaks overlaid.
+
+        Runs `.run_fft()` first if it has not already been run.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure, also stored in `self.figures["fft"]`.
+        """
         if self.power is None:
             self.run_fft()
         s = self.settings
@@ -940,6 +1829,18 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_radial_spectrum(self):
+        """
+        Plot the azimuthally averaged FFT power spectrum on a log scale,
+        annotated with the periods of paired FFT peaks.
+
+        Runs `.run_fft()` first if it has not already been run.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure, also stored in
+            `self.figures["radial_spectrum"]`.
+        """
         if self.power is None:
             self.run_fft()
         rq, rp = radial_spectrum(self.power, self.fx, self.fy)
@@ -968,6 +1869,19 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_autocorrelation(self):
+        """
+        Plot the 2D autocorrelation map with paired peaks and the
+        data-driven lattice basis and predicted lattice points overlaid.
+
+        Runs `.run_autocorrelation()` and/or `.find_lattice()` first if they
+        have not already been run.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure, also stored in
+            `self.figures["autocorrelation"]`.
+        """
         if self.ac is None:
             self.run_autocorrelation()
         if self.lattice is None:
@@ -1022,6 +1936,18 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_direct_vs_crystal(self):
+        """
+        Plot a comparison of the AFM-derived basis vector lengths against
+        crystallographic a and c lengths for each reference phase.
+
+        Returns
+        -------
+        matplotlib.figure.Figure or None
+            The created figure, also stored in
+            `self.figures["direct_vs_crystal"]`. Returns None (and prints a
+            message) if no lattice has been found or no crystal references
+            are set.
+        """
         if self.lattice is None or not self.crystal_refs:
             print("No lattice or no crystal references set.")
             return None
@@ -1051,6 +1977,20 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_fft_reciprocal_lattice(self):
+        """
+        Plot observed paired FFT peaks against the reciprocal lattice
+        predicted from the data-driven real-space basis.
+
+        Runs `.run_fft()` first if it has not already been run.
+
+        Returns
+        -------
+        matplotlib.figure.Figure or None
+            The created figure, also stored in
+            `self.figures["fft_reciprocal_lattice"]`. Returns None (and
+            prints a message) if no lattice (with a valid reciprocal basis)
+            has been found.
+        """
         if self.lattice is None or self.lattice.get("G") is None:
             print("No lattice found; call find_lattice() first.")
             return None
@@ -1091,6 +2031,17 @@ class AFMLatticeAnalysis:
         return fig
 
     def plot_all(self):
+        """
+        Generate all standard plots: real space, FFT, radial spectrum,
+        autocorrelation, crystal comparison (if available), and FFT vs.
+        reciprocal lattice.
+
+        Returns
+        -------
+        dict
+            Mapping from plot name to the corresponding
+            `matplotlib.figure.Figure`.
+        """
         self.plot_real_space()
         self.plot_fft()
         self.plot_radial_spectrum()
@@ -1101,6 +2052,21 @@ class AFMLatticeAnalysis:
         return self.figures
 
     def save_all(self):
+        """
+        Write all analysis results (FFT peaks, paired periodicities,
+        harmonics, ACF peaks and pairs, crystal comparisons, lattice
+        parameters, radial spectrum, autocorrelation matrix, and image data)
+        to CSV files in `output_dir`, along with a text summary.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        RuntimeError
+            If called before `.load()`.
+        """
         self._ensure_loaded()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1144,6 +2110,14 @@ class AFMLatticeAnalysis:
         print(f"All results saved to: {self.output_dir.resolve()}")
 
     def _write_summary(self):
+        """
+        Write a human-readable text summary of the calibration, FFT,
+        autocorrelation, and lattice results to `output_dir`.
+
+        Returns
+        -------
+        None
+        """
         ny, nx = self.img.shape
         dqx = float(np.mean(np.diff(self.fx))) if self.fx is not None else float("nan")
         dqy = float(np.mean(np.diff(self.fy))) if self.fy is not None else float("nan")
@@ -1189,6 +2163,15 @@ class AFMLatticeAnalysis:
         write_summary(self.output_dir / "analysis_summary.txt", sections)
 
     def print_report(self):
+        """
+        Print a formatted text report of the FFT periodicities, harmonic
+        candidates, global lattice result, and crystal comparison (if
+        available) to stdout.
+
+        Returns
+        -------
+        None
+        """
         print("\n" + "=" * 82)
         print("AFM FFT + 2D AUTOCORRELATION: DATA-DRIVEN LATTICE ANALYSIS")
         print("=" * 82)
@@ -1236,6 +2219,25 @@ class AFMLatticeAnalysis:
                       f"beta diff={r['beta_abs_difference_deg']:6.2f} deg")
 
     def run_all(self, crystal_phases=None, verbose=True):
+        """
+        Run the full analysis pipeline: load data, compute FFT and
+        autocorrelation, find the global lattice, optionally compare to
+        crystal phases, generate all plots, and save all results.
+
+        Parameters
+        ----------
+        crystal_phases : dict or None, optional
+            Crystallographic reference phases to compare against, as
+            accepted by `.compare_to_crystal_phases()`, by default None.
+        verbose : bool, optional
+            If True, print loading info and a final text report, by default
+            True.
+
+        Returns
+        -------
+        AFMLatticeAnalysis
+            The instance itself, to allow method chaining.
+        """
         self.load(verbose=verbose)
         self.run_fft()
         self.run_autocorrelation()
@@ -1249,6 +2251,18 @@ class AFMLatticeAnalysis:
         return self
 
     def _ensure_loaded(self):
+        """
+        Verify that the input image has been loaded.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        RuntimeError
+            If `.load()` (or `.run_all()`) has not yet been called.
+        """
         if self.img is None:
             raise RuntimeError("Call .load() first (or .run_all()).")
 
@@ -1330,6 +2344,24 @@ _SETTINGS_DOCS = {
 }
 
 def describe_settings(current=None, group=None):
+    """
+    Print a human-readable description of the available analysis settings,
+    grouped by category, with safety annotations and current values.
+
+    Parameters
+    ----------
+    current : Settings or None, optional
+        If given, display this instance's values (highlighting any that
+        differ from the defaults) instead of the default `Settings` values,
+        by default None.
+    group : str or None, optional
+        If given, only print sections whose name contains this substring
+        (case-insensitive), by default None (print all sections).
+
+    Returns
+    -------
+    None
+    """
     defaults = Settings()
     ref = current if current is not None else defaults
 
