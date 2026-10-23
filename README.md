@@ -13,7 +13,8 @@ The name stands for **self-superVised Image denoising with Paired learning and E
 
 ## Denoising Example
 
-![PLACEHOLDER: Second AFM example comparing trace, retrace, and VIPER output.](docs/images/denoising-example.png)
+![PLACEHOLDER: First AFM example comparing trace, retrace, and VIPER output.](docs/images/denoising-example.png)
+![PLACEHOLDER: Second AFM example comparing trace, retrace, and VIPER output.](docs/images/denoising-example2.png)
 
 *Denoised Example, from left to right: AFM Trace, AFM Retrace, Denoised, Difference*
 
@@ -69,15 +70,16 @@ To use your own data, provide paired XYZ text files with a shared base name and 
 | [VIPER-2-Analysis](VIPER-2-Analysis.ipynb) | Analyze the denoised images. |
 | [VIPER-3-Crystal](VIPER-3-Crystal.ipynb) | Analyze crystal lattices in denoised AFM images. |
 
+## Architectures
 Available model options are `n2n`, `unet`, `vit`, `attn_unet`, and `swin`. Configuration details and additional plots are provided in the notebooks.
 
 | Label | Architecture |
 | --- | --- |
-| `n2n` | Convolutional encoder–decoder with skip connections, including a direct connection from the input to the final decoder stage. |
-| `unet` | U-Net with convolutional encoder and decoder blocks connected by multiscale skip connections. |
-| `vit` | Vision Transformer denoiser with global self-attention over image patches and linear patch reconstruction. |
-| `attn_unet` | U-Net with multihead spatial self-attention in selected encoder and decoder stages and the bottleneck. |
-| `swin` | Swin-style Transformer denoiser with alternating regular and shifted-window self-attention and linear patch reconstruction. |
+| `n2n` | Noise2Noise-style CNN encoder-decoder with skip connections from each encoder stage and the raw input. |
+| `unet` | Classic U-Net: symmetric conv encoder/decoder with skip connections at matching resolutions. |
+| `vit` | Vision Transformer that patchifies the image and applies global self-attention across all patches. |
+| `attn_unet` | U-Net enhanced with 2D self-attention blocks in the deeper encoder/decoder/bottleneck stages. |
+| `swin` | Swin Transformer-style model using shifted-window local self-attention instead of global attention. |
 
 ## Publication and citation
 
