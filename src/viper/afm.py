@@ -12,6 +12,22 @@ from pathlib import Path
 
 class AFMImage():
     def __init__(self, path=None, unit=None, tensor=None, apix=None, device=None):
+        """
+        Initialize an AFMImage object from a file path or tensor.
+
+        Parameters
+        ----------
+        path : str or Path, optional
+            Path to an XYZ-format file to load.
+        unit : str, optional
+            Unit of the input coordinates ("A" or "nm").
+        tensor : array_like, optional
+            Pre-loaded 2D height map to use directly.
+        apix : float, optional
+            Pixel size (Angstroms per pixel), overrides computed spacing.
+        device : str, optional
+            Device to use ('cuda' or 'cpu'). Defaults to CUDA if available.
+        """
         self.img = None
         self.apix = apix
         self.n_pixels = None
@@ -24,50 +40,21 @@ class AFMImage():
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         else: self.device = device
-    
-    def read_xyz_file_old(self, path):
-        with open(path, "r") as f:
-            first_line = f.readline().strip().split()
-
-        is_numeric = True
-        for token in first_line:
-            try: float(token)
-            except ValueError:
-                is_numeric = False
-                break
-
-        if is_numeric:
-            df = pd.read_csv(path, sep=r"\s+", header=None, names=["x", "y", "z"])
-        else: df = pd.read_csv(path, sep=r"\s+")
-        return df
-
-    def read_path_old(self, path, unit="A"):
-        # Read file
-        df = self.read_xyz_file(path)
-
-        # Get unique x and y values to determine grid dimensions
-        x_unique = df['x'].unique()
-        y_unique = df['y'].unique()
-
-        # Calculate pixel sizes
-        x_pixel_size = (x_unique[-1] - x_unique[0])/(len(x_unique) - 1)
-        y_pixel_size = (y_unique[-1] - y_unique[0])/(len(y_unique) - 1)
-
-        if self.apix is not None:
-            x_pixel_size = self.apix
-            y_pixel_size = self.apix
-        elif x_pixel_size != y_pixel_size:
-            if math.isclose(x_pixel_size, y_pixel_size, rel_tol=1e-4):
-                x_pixel_size = 0.5*(x_pixel_size + y_pixel_size)
-                y_pixel_size = x_pixel_size
-            else:
-                raise(f"X and Y spacing are not the same! {x_pixel_size} vs {y_pixel_size}")
-        
-        # Reshape z values into a 2D grid
-        Z = df['z'].values.reshape(len(y_unique), len(x_unique))
-        self.read_tensor(Z, x_pixel_size, unit)
 
     def read_xyz_file(self, path):
+        """
+        Read and validate a whitespace-delimited XYZ file into a DataFrame.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the XYZ file.
+
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame with columns "x", "y", "z", containing finite values.
+        """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"File not found:\n{path}")
@@ -92,6 +79,16 @@ class AFMImage():
         return pd.DataFrame(xyz, columns=["x", "y", "z"])
 
     def read_path(self, path, unit="A"):
+        """
+        Load an XYZ file, reconstruct a uniformly-spaced 2D grid, and store it as the image tensor.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the XYZ file.
+        unit : str, optional
+            Unit of the input coordinates ("A" or "nm"), by default "A".
+        """
         df = self.read_xyz_file(path)
 
         x = df["x"].to_numpy()
@@ -152,6 +149,18 @@ class AFMImage():
         self.read_tensor(Z, x_pixel_size, unit)
     
     def read_tensor(self, tensor, apix, unit="A"):
+        """
+        Store a 2D tensor as the image, converting units and setting pixel size.
+
+        Parameters
+        ----------
+        tensor : array_like
+            2D height map to store.
+        apix : float
+            Pixel size in the given unit.
+        unit : str, optional
+            Unit of apix ("A" or "nm"), by default "A".
+        """
         norm = 1.
         if unit == "A": norm = 1.
         if unit == "nm": norm = 10.
@@ -160,12 +169,50 @@ class AFMImage():
         self.n_pixels = self.img.shape[0]
 
     def normalize_std(self, img):
+        """
+        Normalize an image to zero mean and unit standard deviation.
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            Input image.
+
+        Returns
+        -------
+        torch.Tensor
+            Standardized image.
+        """
         return (img - img.mean())/img.std()
 
     def normalize_1(self, img):
+        """
+        Normalize an image to the range [0, 1].
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            Input image.
+
+        Returns
+        -------
+        torch.Tensor
+            Min-max normalized image.
+        """
         return (img - img.min())/(img.max() - img.min())
     
     def write_image(self, tensor=None, apix=None, name='output.txt'):
+        """
+        Write a 2D height map to a tab-delimited XYZ text file.
+
+        Parameters
+        ----------
+        tensor : array_like, optional
+            2D height map to write. Defaults to self.img.
+        apix : float, optional
+            Pixel size used to generate x/y coordinates. Defaults to self.apix.
+        name : str, optional
+            Output file path, by default 'output.txt'.
+        """
         if tensor is None: tensor = self.img
         if apix is None: apix = self.apix
 
@@ -191,6 +238,14 @@ class AFMImage():
                     f.write(f'{x:.5f}\t{y:.5f}\t{z:.6f}\n')
 
     def view_image(self, img=None):
+        """
+        Display a 2D image using matplotlib with a height colorbar.
+
+        Parameters
+        ----------
+        img : torch.Tensor, optional
+            Image to display. Defaults to self.img.
+        """
         if img is None: img = self.img
         iplot = img.detach().cpu().numpy()
         plt.imshow(iplot)
@@ -198,6 +253,21 @@ class AFMImage():
         plt.show()
 
     def ncc(self, img, target):
+        """
+        Compute the normalized cross-correlation between two images.
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            First input image.
+        target : torch.Tensor
+            Second input image to compare against.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar normalized cross-correlation value.
+        """
         img_norm = img - img.mean()
         tar_norm = target - target.mean()
         num = torch.sum(img_norm*tar_norm)
@@ -205,12 +275,42 @@ class AFMImage():
         return num/den
     
     def cosine(self, img, target):
+        """
+        Compute the cosine similarity between two flattened images.
+        
+        Parameters
+        ----------
+        img : torch.Tensor
+            First input image.
+        target : torch.Tensor
+            Second input image to compare against.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar cosine similarity value.
+        """
         img_flat = img.flatten()
         tar_flat = target.flatten()
         sim = torch.nn.functional.cosine_similarity(img_flat, tar_flat, dim=0)
         return sim
     
     def cc_fft(self, img, target):
+        """
+        Compute the mean cross-correlation between two images via FFT.
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            First input image.
+        target : torch.Tensor
+            Second input image to compare against.
+
+        Returns
+        -------
+        torch.Tensor
+            Mean real-valued cross-correlation computed in frequency space.
+        """
         img_mean = img - img.mean()
         tar_mean = target - target.mean()
         Fimg = fft.fftn(img_mean.float())
@@ -220,4 +320,19 @@ class AFMImage():
         return CC.mean()
     
     def mse(self, img, target):
+        """
+        Compute the mean squared error between two images.
+        
+        Parameters
+        ----------
+        img : torch.Tensor
+            First input image.
+        target : torch.Tensor
+            Second input image to compare against.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar mean squared error.
+        """
         return F.mse_loss(img, target)

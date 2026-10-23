@@ -9,10 +9,39 @@ from stripes import plot_stripe_boxes_diagnostic
 
 class Dataset:
     def __init__(self, path=None, unit="A"):
+        """
+        Initialize a Dataset, optionally loading trace/retrace AFM images from a path.
+
+        Parameters
+        ----------
+        path : str, optional
+            Directory containing HeightTrace/HeightRetrace image files.
+        unit : str, optional
+            Unit of the input coordinates ("A" or "nm"), by default "A".
+        """
         if path is not None:
             self.read_path(path, unit)
 
     def read_files(self, path, files, is_trace, imgs):
+        """
+        Load a list of AFM image files into a nested image dictionary.
+
+        Parameters
+        ----------
+        path : str
+            Directory containing the files.
+        files : list of str
+            Filenames to load.
+        is_trace : bool
+            If True, treat files as "HeightTrace" images; otherwise "HeightRetrace".
+        imgs : dict
+            Nested dictionary to populate, with "trace"/"retrace" keys.
+        
+        Returns
+        -------
+        dict
+            Updated imgs dictionary with loaded image data.
+        """
         rep = "HeightTrace" if is_trace else "HeightRetrace"
         key = "trace" if is_trace else "retrace"
         for f in files:
@@ -27,6 +56,29 @@ class Dataset:
         return imgs
 
     def fuse_files(self, imgs):
+        """
+        Pair matching trace and retrace images by shared filename key.
+
+        Parameters
+        ----------
+        imgs : dict
+            Nested dictionary with "trace" and "retrace" image entries.
+        
+        Returns
+        -------
+        X : list of torch.Tensor
+            Trace images.
+        y : list of torch.Tensor
+            Retrace images.
+        apix : list of float
+            Pixel sizes for each paired image.
+        name : list of str
+            Original filenames.
+        mx : list of torch.Tensor
+            Empty boolean masks for trace images.
+        my : list of torch.Tensor
+            Empty boolean masks for retrace images.
+        """
         X, y, apix, name = [], [], [], []
         mx, my = [], []
         for tkey in imgs["trace"].keys():
@@ -40,6 +92,16 @@ class Dataset:
         return X, y, apix, name, mx, my
 
     def read_path(self, path, unit="A"):
+        """
+        Load all trace/retrace AFM images from a directory and stack them into tensors.
+
+        Parameters
+        ----------
+        path : str
+            Directory containing HeightTrace/HeightRetrace image files.
+        unit : str, optional
+            Unit of the input coordinates ("A" or "nm"), by default "A".
+        """
         files_x = [f for f in os.listdir(path) if "HeightTrace" in f]
         files_y = [f for f in os.listdir(path) if "HeightRetrace" in f]
 
@@ -55,6 +117,7 @@ class Dataset:
         print(f"Loaded Dataset (n, h, w): {self.X_raw.shape}")
 
     def reset_stripe_masks(self):
+        """Reset all trace and retrace stripe masks to all-False."""
         for i in range(len(self.imgs_y)):
             self.mask_x[i] = torch.zeros_like(self.imgs_x[i]).bool()
             self.mask_y[i] = torch.zeros_like(self.imgs_y[i]).bool()
@@ -62,6 +125,32 @@ class Dataset:
     def make_stripe_masks(
             self, idx=None, k=3.5, k_pos=None, k_neg=None, row_window=4,
             smooth_len=9, min_length=10, min_thickness=1, min_area=10, output="."):
+        """
+        Detect and store stripe masks for all trace/retrace image pairs.
+
+        Parameters
+        ----------
+        idx : int, optional
+            Index of the image for which to display the diagnostic plot.
+        k : float, optional
+            Default threshold multiplier (in robust sigma) for both polarities, by default 3.5.
+        k_pos : float, optional
+            Threshold multiplier for positive stripes. Defaults to k.
+        k_neg : float, optional
+            Threshold multiplier for negative stripes. Defaults to k.
+        row_window : int, optional
+            Window size for the row-wise median filter, by default 4.
+        smooth_len : int, optional
+            Length of the 1D smoothing filter applied along rows, by default 9.
+        min_length : int, optional
+            Minimum column extent required to keep a stripe component, by default 10.
+        min_thickness : int, optional
+            Minimum row extent required to keep a stripe component, by default 1.
+        min_area : int, optional
+            Minimum component area required to draw a box, by default 10.
+        output : str, optional
+            Output directory for saved diagnostic figures, by default ".".
+        """
         for i in range(len(self.imgs_y)):
             plot = False
             fig, axes, mx, px, nx, resx = plot_stripe_boxes_diagnostic(
@@ -79,6 +168,14 @@ class Dataset:
             self.mask_y[i] = torch.as_tensor(my).bool()
 
     def view_image(self, idx):
+        """
+        Display the trace and retrace images for a given index side by side.
+
+        Parameters
+        ----------
+        idx : int
+            Index of the image pair to display.
+        """
         xplot = self.X_raw[idx].detach().cpu().numpy()
         yplot = self.y_raw[idx].detach().cpu().numpy()
 
@@ -90,12 +187,56 @@ class Dataset:
         plt.show()
 
     def find_cc(self, im1, im2):
+        """
+        Compute the normalized cross-correlation between two images.
+
+        Parameters
+        ----------
+        im1 : torch.Tensor
+            First input image.
+        im2 : torch.Tensor
+            Second input image.
+        
+        Returns
+        -------
+        torch.Tensor or float
+            Normalized cross-correlation value, or 0.0 if either image has zero energy.
+        """
         num = torch.sum(im1*im2)
         denom = torch.sqrt(torch.sum(im1*im1) * torch.sum(im2*im2))
         if denom == 0: return 0.0
         return num/denom
 
     def _best_shift_ncc(self, region, crop_x, crop_height, crop_width, low_range, high_range):
+        """
+        Find the shift maximizing normalized cross-correlation between a crop and a search region.
+
+        Parameters
+        ----------
+        region : array_like
+            Search region to scan for the best-matching crop.
+        crop_x : array_like
+            Reference crop to match against.
+        crop_height : int
+            Height of the crop window.
+        crop_width : int
+            Width of the crop window.
+        low_range : int
+            Lower bound of the shift search range.
+        high_range : int
+            Upper bound of the shift search range (exclusive).
+        
+        Returns
+        -------
+        best_cc : torch.Tensor
+            Best normalized cross-correlation value found.
+        best_dy : int
+            Row shift corresponding to the best match.
+        best_dx : int
+            Column shift corresponding to the best match.
+        best_crop_y : torch.Tensor
+            Best-matching crop extracted from the search region.
+        """
         # Normalize to tensors in case data is a mix of tensors and np arrays
         if not torch.is_tensor(region):
             region = torch.as_tensor(region)
@@ -128,6 +269,24 @@ class Dataset:
     def random_crops(
             self, crop_num=3000, crop_width=32, crop_height=32,
             low_range=-10, high_range=11, drift_mode='per_crop'):
+        """
+        Extract drift-corrected random crop pairs from all trace/retrace images.
+
+        Parameters
+        ----------
+        crop_num : int, optional
+            Number of random crops per image, by default 3000.
+        crop_width : int, optional
+            Width of each crop, by default 32.
+        crop_height : int, optional
+            Height of each crop, by default 32.
+        low_range : int, optional
+            Lower bound of the drift search range, by default -10.
+        high_range : int, optional
+            Upper bound of the drift search range (exclusive), by default 11.
+        drift_mode : str, optional
+            Drift estimation strategy, either 'per_crop' or 'per_image', by default 'per_crop'.
+        """
         assert drift_mode in ('per_crop', 'per_image'), \
             f"drift_mode must be 'per_crop' or 'per_image', got {drift_mode!r}"
 
@@ -252,6 +411,23 @@ class Dataset:
         self.plot_drift(show_current_cut=False)
 
     def plot_drift(self, bins=None, show_current_cut=True):
+        """
+        Plot a 2D histogram of estimated trace/retrace drift values.
+
+        Parameters
+        ----------
+        bins : int or sequence, optional
+            Histogram bin specification. Defaults to a range spanning the drift values.
+        show_current_cut : bool, optional
+            If True, overlay the current quality_cut bounds, by default True.
+        
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The created figure.
+        ax : matplotlib.axes.Axes
+            The plot axes.
+        """
         dx = self.drift_x
         dy = self.drift_y
         if torch.is_tensor(dx):
@@ -290,6 +466,29 @@ class Dataset:
         return fig, ax
 
     def fit_affine_intensity(self, crop_x, crop_y, valid_mask=None, eps=1e-8):
+        """
+        Fit an affine intensity transform mapping crop_y onto crop_x via least squares.
+
+        Parameters
+        ----------
+        crop_x : torch.Tensor
+            Reference crop.
+        crop_y : torch.Tensor
+            Crop to be intensity-matched to crop_x.
+        valid_mask : torch.Tensor, optional
+            Boolean mask selecting valid pixels to fit on. Defaults to all pixels.
+        eps : float, optional
+            Unused numerical safeguard, by default 1e-8.
+        
+        Returns
+        -------
+        crop_y_matched : torch.Tensor
+            Intensity-matched version of crop_y.
+        a : torch.Tensor
+            Fitted scale coefficient.
+        b : torch.Tensor
+            Fitted offset coefficient.
+        """
         if valid_mask is not None:
             vmask = valid_mask.bool()
             vx = crop_x[vmask].flatten()
@@ -314,6 +513,14 @@ class Dataset:
         return crop_y_matched, a, b
 
     def normalize(self, use_affine=False):
+        """
+        Normalize cut crops to a common intensity scale, with optional affine matching.
+
+        Parameters
+        ----------
+        use_affine : bool, optional
+            If True, affine-match each y crop to its x crop before normalizing, by default False.
+        """
         x = self.x_cuts
         y = self.y_cuts
         has_masks = hasattr(self, 'crops_mx') and hasattr(self, 'crops_my')
@@ -361,6 +568,20 @@ class Dataset:
         print(f'-> y_norm range: {self.y_norm.min().item()}, {self.y_norm.max().item()}')
 
     def quality_cut(self, x_min=-4, x_max=0, y_min=-2, y_max=2):
+        """
+        Filter crops by drift magnitude and store the retained subset.
+        
+        Parameters
+        ----------
+        x_min : int, optional
+            Minimum allowed X drift, by default -4.
+        x_max : int, optional
+            Maximum allowed X drift, by default 0.
+        y_min : int, optional
+            Minimum allowed Y drift, by default -2.
+        y_max : int, optional
+            Maximum allowed Y drift, by default 2.
+        """
         self.x_min = x_min
         self.x_max = x_max
         self.y_min = y_min
