@@ -392,7 +392,7 @@ class N2N(nn.Module):
 class UNet(nn.Module):
     def __init__(
             self, channels=1, filters=(16, 32, 64, 128, 256),
-            bottleneck_filters=512, activation="relu"):
+            bottleneck_filters=512, activation="relu", use_x_skip=False):
         """
         A standard U-Net with double-convolution encoder/decoder stages,
         max-pooling downsampling, a convolutional bottleneck, and
@@ -411,6 +411,8 @@ class UNet(nn.Module):
             Activation function used throughout, by default "relu".
         """
         super().__init__()
+        print(f"UNet - use X skip: {use_x_skip}")
+        self.use_x_skip = use_x_skip
         self.pool = nn.MaxPool2d(2, ceil_mode=True)
 
         enc_in = channels
@@ -434,6 +436,11 @@ class UNet(nn.Module):
                 kernel_size=3, stride=2))
             in_ch = f
 
+        if self.use_x_skip:
+            self.x_skip_decoder = DecoderBlock(
+                rev_filters[-1], channels, rev_filters[-1],
+                activation=activation, kernel_size=3, stride=1)
+
         self.out_conv = nn.Conv2d(rev_filters[-1], channels, 3, padding="same")
 
     def forward(self, x):
@@ -448,6 +455,7 @@ class UNet(nn.Module):
         torch.Tensor
             Output tensor of shape (B, channels, H, W).
         """
+        inp = x
         skips = []
         for enc in self.encoders:
             x = enc(x)
@@ -458,12 +466,15 @@ class UNet(nn.Module):
         for dec, skip in zip(self.decoders, reversed(skips)):
             x = dec(x, skip)
 
+        if self.use_x_skip:
+            x = self.x_skip_decoder(x, inp)
+
         return self.out_conv(x)
 
 class ViTDenoiser(nn.Module):
     def __init__(
             self, img_size=32, channels=1, patch_size=4, dim=192,
-            depth=6, num_heads=6, mlp_ratio=4.0, dropout=0.0):
+            depth=6, num_heads=6, mlp_ratio=4.0, dropout=0.0, use_x_skip=False):
         """
         A Vision Transformer-based image denoiser: splits the image into
         non-overlapping patches, processes them with a stack of Transformer
@@ -498,6 +509,8 @@ class ViTDenoiser(nn.Module):
         self.grid = img_size // patch_size
         num_patches = self.grid**2
         patch_dim = channels*patch_size * patch_size
+        self.use_x_skip = use_x_skip
+        print(f"Vit - use X skip: {use_x_skip}")
 
         self.patch_embed = nn.Linear(patch_dim, dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, dim))
@@ -508,6 +521,13 @@ class ViTDenoiser(nn.Module):
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
+
+        if self.use_x_skip:
+            self.x_skip_conv = nn.Sequential(
+                nn.Conv2d(channels*2, channels*2, 3, padding="same"),
+                nn.ReLU(),
+                nn.Conv2d(channels*2, channels, 3, padding="same"),
+            )
 
         # simple linear decoder: project each token back to a pixel patch
         self.head = nn.Linear(dim, patch_dim)
@@ -574,6 +594,7 @@ class ViTDenoiser(nn.Module):
         ValueError
             If the input spatial dimensions don't match `img_size`.
         """
+        inp = x
         b, c, h, w = x.shape
         if h != self.img_size or w != self.img_size:
             raise ValueError(
@@ -583,13 +604,18 @@ class ViTDenoiser(nn.Module):
             tokens = blk(tokens)
         tokens = self.norm(tokens)
         patches_out = self.head(tokens)
-        return self._unpatchify(patches_out, b)
+        out = self._unpatchify(patches_out, b)
+
+        if self.use_x_skip:
+            out = self.x_skip_conv(torch.cat([out, inp], dim=1))
+            
+        return out
 
 class AttnUNet(nn.Module):
     def __init__(
             self, channels=1, filters=(16, 32, 64, 128, 256),
             bottleneck_filters=512, activation="relu",
-            attn_heads=4, attn_from_stage=2):
+            attn_heads=4, attn_from_stage=2, use_x_skip=False):
         """
         A U-Net variant with self-attention blocks inserted at deeper
         encoder/decoder stages and in the bottleneck.
@@ -614,6 +640,8 @@ class AttnUNet(nn.Module):
             stages at an equivalent depth from the bottleneck, by default 2.
         """
         super().__init__()
+        print(f"Attn-UNet - use X skip: {use_x_skip}")
+        self.use_x_skip = use_x_skip
         self.pool = nn.MaxPool2d(2, ceil_mode=True)
         self.attn_from_stage = attn_from_stage
 
@@ -648,6 +676,11 @@ class AttnUNet(nn.Module):
             )
             in_ch = f
 
+        if self.use_x_skip:
+            self.x_skip_decoder = DecoderBlock(
+                rev_filters[-1], channels, rev_filters[-1],
+                activation=activation, kernel_size=3, stride=1)
+
         self.out_conv = nn.Conv2d(rev_filters[-1], channels, 3, padding="same")
 
     def forward(self, x):
@@ -662,6 +695,7 @@ class AttnUNet(nn.Module):
         torch.Tensor
             Output tensor of shape (B, channels, H, W).
         """
+        inp = x
         skips = []
         for enc, attn in zip(self.encoders, self.enc_attn):
             x = enc(x)
@@ -675,661 +709,10 @@ class AttnUNet(nn.Module):
             x = dec(x, skip)
             x = attn(x)
 
+        if self.use_x_skip:
+            x = self.x_skip_decoder(x, inp)
+
         return self.out_conv(x)
-
-class Denoiser:
-    def __init__(self, name="Denoiser", device="cpu"):
-        """
-        High-level training/evaluation wrapper around the denoiser
-        architectures in `MODEL_REGISTRY`, handling dataset splitting, model
-        construction, training with masked loss, checkpointing, prediction, and
-        visualization.
-
-        Parameters
-        ----------
-        name : str, optional
-            Name used for logging and checkpoint filenames, by default
-            "Denoiser".
-        device : str, optional
-            Torch device string (e.g. "cpu" or "cuda") to run the model on, by
-            default "cpu".
-        """
-        self.name = name
-        self.device = torch.device(device)
-        self.model = None
-
-    def set_dataset(self, data):
-        """
-        Attach a dataset object providing paired AFM crops to the wrapper.
-
-        Parameters
-        ----------
-        data : object
-            Dataset object exposing `cuts_num`, `x_cuts`/`x_norm`,
-            `y_cuts`/`y_norm`, `mx_cuts`, `my_cuts`, and optionally
-            `crop_w`, `crop_h`, `channels`.
-
-        Returns
-        -------
-        None
-        """
-        self.dataset = data
-
-    def split(self, fractions=(0.7, 0.2, 0.1), norm=False):
-        """
-        Randomly split the attached dataset into train, train-validation,
-        and test subsets, and construct a reversed-direction (Y -> X)
-        validation set from the train-validation crops.
-
-        Parameters
-        ----------
-        fractions : tuple of float, optional
-            Approximate (train, train_val, test) fractions of the dataset,
-            by default (0.7, 0.2, 0.1). The test fraction is implied by the
-            remainder.
-        norm : bool, optional
-            If True, use the dataset's normalized arrays (`x_norm`,
-            `y_norm`) instead of the raw arrays, by default False.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        Populates `self.train_X/y/MX/My`, `self.train_val_X/y/MX/My`,
-        `self.val_X/y/MX/My` (built by swapping X and Y on the
-        train-validation crops), and `self.test_X/y/MX/My`, along with the
-        corresponding id lists.
-        """
-        n = self.dataset.cuts_num
-        train_size, train_val_size, _ = (np.array(fractions)*n).astype(int)
-        train_i, train_val_i = train_size, train_size + train_val_size
-
-        ids = list(range(n))
-        random.shuffle(ids)
-        self.train_ids = ids[0:train_i]
-        self.train_val_ids = ids[train_i:train_val_i]
-        self.test_ids = ids[train_val_i:n]
-
-        self.norm = norm
-        x = self.dataset.x_cuts if not norm else self.dataset.x_norm
-        y = self.dataset.y_cuts if not norm else self.dataset.y_norm
-        mx = self.dataset.mx_cuts
-        my = self.dataset.my_cuts
-
-        self.train_X  = x[self.train_ids]
-        self.train_y  = y[self.train_ids]
-        self.train_MX = mx[self.train_ids]
-        self.train_My = my[self.train_ids]
-
-        # same-direction held-out set (X -> Y), for monitoring
-        self.train_val_X  = x[self.train_val_ids]
-        self.train_val_y  = y[self.train_val_ids]
-        self.train_val_MX = mx[self.train_val_ids]
-        self.train_val_My = my[self.train_val_ids]
-
-        # real validation: reversed direction (Y -> X) on the SAME crops
-        self.val_X  = y[self.train_val_ids]
-        self.val_y  = x[self.train_val_ids]
-        self.val_MX = my[self.train_val_ids]
-        self.val_My = mx[self.train_val_ids]
-
-        self.test_X  = x[self.test_ids]
-        self.test_y  = y[self.test_ids]
-        self.test_MX = mx[self.test_ids]
-        self.test_My = my[self.test_ids]
-
-    def build_model(
-            self, arch="unet", width=None, height=None, channels=None,
-            lr=1e-3, loss="mse", summary=False, **model_kwargs):
-        """
-        Construct the underlying denoiser model, loss function, and
-        optimizer.
-
-        Parameters
-        ----------
-        arch : str, optional
-            Architecture name, one of the keys in `MODEL_REGISTRY`
-            ("n2n", "unet", "vit", "attn_unet", "swin"), by default "unet".
-        width : int or None, optional
-            Expected crop width. If None, inferred from the attached
-            dataset's `crop_w`, falling back to 32, by default None.
-        height : int or None, optional
-            Expected crop height. If None, inferred from the attached
-            dataset's `crop_h`, falling back to 32, by default None.
-        channels : int or None, optional
-            Number of image channels. If None, inferred from the attached
-            dataset's `channels`, falling back to 1, by default None.
-        lr : float, optional
-            Learning rate for the Adam optimizer, by default 1e-3.
-        loss : {"mse", "mae"} or callable, optional
-            Loss function to use (elementwise, reduction="none"), or a
-            custom callable, by default "mse".
-        summary : bool, optional
-            If True, print the full model architecture, by default False.
-        **model_kwargs
-            Additional keyword arguments forwarded to the model
-            constructor.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            If `arch` is not a key in `MODEL_REGISTRY`.
-        AssertionError
-            If `arch` requires square crops (n2n, vit, swin) and
-            `width != height`.
-        """
-        if arch not in MODEL_REGISTRY:
-            raise ValueError(f"Unknown arch '{arch}'. Options: {list(MODEL_REGISTRY)}")
-
-        if hasattr(self, "dataset"):
-            width = width or getattr(self.dataset, "crop_w", None)
-            height = height or getattr(self.dataset, "crop_h", None)
-            channels = channels or getattr(self.dataset, "channels", None)
-        width = width or 32
-        height = height or 32
-        channels = channels or 1
-
-        if arch in ["n2n", "vit", "swin"]:
-            assert width == height, f"{arch} Denoiser currently assumes square crops"
-            model_kwargs.setdefault("img_size", width)
-        model_kwargs.setdefault("channels", channels)
-
-        self.arch = arch
-        self.model = MODEL_REGISTRY[arch](**model_kwargs).to(self.device)
-
-        self.loss_fn = {
-            "mse": nn.MSELoss(reduction='none'),
-            "mae": nn.L1Loss(reduction='none')}[loss] if isinstance(loss, str) else loss
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-
-        n_params = sum(p.numel() for p in self.model.parameters())
-        print(f"{self.name} ({arch}) built with {n_params:,} parameters.")
-        if summary:
-            print(self.model)
-
-    @staticmethod
-    def _to_nchw(x):
-        """
-        Convert an array/tensor in (N, H, W) or (N, H, W, C) layout to
-        (N, C, H, W) float tensor layout.
-
-        Parameters
-        ----------
-        x : array_like or torch.Tensor
-            Input batch of images.
-
-        Returns
-        -------
-        torch.Tensor
-            Float tensor of shape (N, C, H, W).
-        """
-        if not torch.is_tensor(x):
-            x = torch.as_tensor(x)
-        x = x.float()
-        if x.ndim == 3:
-            x = x.unsqueeze(1) # (N, H, W) -> (N, 1, H, W)
-        elif x.ndim == 4:
-            x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
-        return x
-
-    def _make_loader(self, X, Y, batch_size, shuffle, augment=False, MX=None, MY=None):
-        """
-        Build a DataLoader over paired input/target images and masks.
-
-        Parameters
-        ----------
-        X : array_like or torch.Tensor
-            Input images.
-        Y : array_like or torch.Tensor
-            Target images.
-        batch_size : int
-            Batch size for the DataLoader.
-        shuffle : bool
-            Whether to shuffle samples each epoch.
-        augment : bool, optional
-            If True, wrap the data in an `AFMPairDataset` with random
-            flip/rotation augmentation, by default False.
-        MX : array_like or torch.Tensor or None, optional
-            Mask corresponding to `X`. If None (together with `MY`), an
-            all-ones mask is used, by default None.
-        MY : array_like or torch.Tensor or None, optional
-            Mask corresponding to `Y`. If None (together with `MX`), an
-            all-ones mask is used, by default None.
-
-        Returns
-        -------
-        torch.utils.data.DataLoader
-            DataLoader yielding `(x, y, mx, my)` batches.
-        """
-        X = self._to_nchw(X)
-        Y = self._to_nchw(Y)
-
-        has_masks = (MX is not None) and (MY is not None)
-        if has_masks:
-            MX = self._to_nchw(MX).float()
-            MY = self._to_nchw(MY).float()
-        else:
-            MX = torch.ones_like(X).float()
-            MY = torch.ones_like(X).float()
-
-        if augment:
-            ds = AFMPairDataset(X, Y, mx_cuts=MX, my_cuts=MY, augment=True)
-        else: ds = torch.utils.data.TensorDataset(X, Y, MX, MY)
-        return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-    
-    def _checkpoint_payload(self):
-        """
-        Assemble the dictionary saved to a model checkpoint.
-
-        Returns
-        -------
-        dict
-            Dictionary with keys "model_state_dict", "norm_x_min",
-            "norm_scale", and "use_affine", reflecting the current model
-            and (if `self.norm` is True) the dataset's normalization
-            parameters.
-        """
-        return {
-            "model_state_dict": self.model.state_dict(),
-            "norm_x_min": self.dataset.norm_x_min if self.norm else 0.,
-            "norm_scale": self.dataset.norm_scale if self.norm else 1.,
-            "use_affine": getattr(self, "use_affine", None),
-        }
-
-    def load_model(self, path, map_location=None):
-        """
-        Load model weights (and, if present, normalization statistics)
-        from a checkpoint file.
-
-        Parameters
-        ----------
-        path : str
-            Path to the checkpoint file.
-        map_location : str or torch.device or None, optional
-            Device mapping passed to `torch.load`. Defaults to
-            `self.device` if None, by default None.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        If the checkpoint does not contain a "model_state_dict" key, it is
-        assumed to be a raw state dict, which is loaded directly; a warning
-        is printed that normalization statistics must be supplied manually.
-        """
-        map_location = map_location or self.device
-        checkpoint = torch.load(path, map_location=map_location)
-
-        if "model_state_dict" not in checkpoint:
-            self.model.load_state_dict(checkpoint)
-            print("Warning: no norm stats found in checkpoint, you must supply them manually.")
-            return None
-
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.norm_x_min = checkpoint["norm_x_min"]
-        self.norm_scale = checkpoint["norm_scale"]
-
-        norm = (self.norm_x_min, self.norm_scale)
-        print(f"Loaded checkpoint from {path}")
-        print(f"-> norm_x_min: {self.norm_x_min}")
-        print(f"-> norm_scale: {self.norm_scale}")
-
-    def train(
-            self, epochs=50, batch_size=32, v=1, best_validation=True,
-            patience=None, augment=False, monitor="val_loss", output="."):
-        """
-        Train the model with a masked reconstruction loss, tracking
-        training, same-direction validation, and reversed-direction
-        validation losses, with optional early stopping and checkpointing.
-
-        Parameters
-        ----------
-        epochs : int, optional
-            Maximum number of training epochs, by default 50.
-        batch_size : int, optional
-            Batch size used for training and evaluation, by default 32.
-        v : int, optional
-            Verbosity level: 0 for silent, 1 for per-epoch progress, >1 for
-            per-batch progress bars, by default 1.
-        best_validation : bool, optional
-            If True, reload the best checkpoint (by `monitor`) at the end
-            of training, by default True.
-        patience : int or None, optional
-            Number of epochs without improvement in `monitor` after which
-            training stops early. If None, no early stopping is applied, by
-            default None.
-        augment : bool, optional
-            If True, apply random flip/rotation augmentation to the
-            training set, by default False.
-        monitor : {"val_loss", "train_val_loss", "train_loss"}, optional
-            Metric used to select the best checkpoint and for early
-            stopping, by default "val_loss".
-        output : str, optional
-            Directory in which to save the best model checkpoint and
-            training history, by default ".".
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        The masked loss is computed as `loss_fn(pred, target) * (1 - mask)`,
-        averaged over all elements, so masked-out regions (mask == 1) are
-        excluded. Saves `{output}/{self.name}.pt` (best checkpoint) and
-        `{output}/history.pt` (loss history), and displays a plot of the
-        training/validation loss curves on a log scale.
-        """
-        assert monitor in ("val_loss", "train_val_loss", "train_loss"), \
-            "monitor must be 'val_loss' or 'train_val_loss'"
-
-        if not os.path.exists(output):
-            os.makedirs(output, exist_ok=True)
-        best_model_path = f"{output}/{self.name}.pt"
-        history_path = f"{output}/history.pt"
-
-        train_loader = self._make_loader(
-            self.train_X, self.train_y, batch_size, shuffle=True,
-            augment=augment, MX=self.train_MX, MY=self.train_My)
-        train_val_loader = self._make_loader(
-            self.train_val_X, self.train_val_y, batch_size, shuffle=False,
-            augment=False, MX=self.train_val_MX, MY=self.train_val_My)
-        val_loader = self._make_loader(
-            self.val_X, self.val_y, batch_size, shuffle=False,
-            augment=False, MX=self.val_MX, MY=self.val_My)
-
-        history = {"loss": [], "train_val_loss": [], "val_loss": []}
-        best_monitored_loss = float("inf")
-        epochs_no_improve = 0
-
-        def _eval(loader):
-            self.model.eval()
-            running, n_seen = 0.0, 0
-            with torch.no_grad():
-                for xb, yb, mxb, myb in loader:
-                    xb, yb = xb.to(self.device), yb.to(self.device)
-                    mxb, myb = mxb.to(self.device), myb.to(self.device)
-                    pred = self.model(xb)
-                    loss = (self.loss_fn(pred, yb)*(1 - myb)).mean()
-                    running += loss.item() * xb.size(0)
-                    n_seen += xb.size(0)
-            return running / max(n_seen, 1)
-
-        for epoch in range(epochs):
-            self.model.train()
-            running_loss = 0.0
-            n_seen = 0
-            n_batches = len(train_loader)
-            bar_len = 30
-
-            for batch_idx, (xb, yb, mxb, myb) in enumerate(train_loader):
-                xb, yb = xb.to(self.device), yb.to(self.device)
-                mxb, myb = mxb.to(self.device), myb.to(self.device)
-
-                self.optimizer.zero_grad()
-                pred = self.model(xb)
-                loss = (self.loss_fn(pred, yb)*(1 - myb)).mean()
-                loss.backward()
-                self.optimizer.step()
-
-                batch_loss = loss.item()
-                running_loss += batch_loss*xb.size(0)
-                n_seen += xb.size(0)
-
-                if v > 1:
-                    frac = (batch_idx + 1)/n_batches
-                    filled = int(bar_len*frac)
-                    bar = "#"*filled + "-"*(bar_len - filled)
-                    print(f"\rEpoch {epoch + 1}/{epochs} [{bar}] "
-                        f"batch {batch_idx + 1}/{n_batches} "
-                        f"- batch_loss: {batch_loss:.6f}", end="", flush=True)
-
-            train_loss = running_loss/max(n_seen, 1)
-            train_val_loss = _eval(train_val_loader)
-            val_loss = _eval(val_loader)
-
-            history["loss"].append(train_loss)
-            history["train_val_loss"].append(train_val_loss)
-            history["val_loss"].append(val_loss)
-
-            monitored = None
-            if monitor == "train_val_loss": monitored = train_val_loss
-            if monitor == "val_loss":       monitored = val_loss
-            if monitor == "train_loss":     monitored = train_loss
-
-            if monitored < best_monitored_loss:
-                best_monitored_loss = monitored
-                epochs_no_improve = 0
-                torch.save(self._checkpoint_payload(), best_model_path)
-            else: epochs_no_improve += 1
-
-            if v:
-                epoch_frac = (epoch + 1)/epochs
-                epoch_filled = int(bar_len*epoch_frac)
-                epoch_bar = "#"*epoch_filled + "-"*(bar_len - epoch_filled)
-                add_best = " (*)" if not epochs_no_improve else ""
-                print(
-                    f"\rEpoch {epoch + 1}/{epochs} [{epoch_bar}] loss: {train_loss:.6f} "
-                    f"- train_val_loss: {train_val_loss:.6f} "
-                    f"- val_loss: {val_loss:.6f}{add_best}" + " "*15)
-
-            if patience is not None and epochs_no_improve >= patience:
-                print(f"Early stopping: no improvement in {monitor} for "
-                    f"{patience} epochs (best {monitor}: {best_monitored_loss:.6f})")
-                break
-        self.history = history
-        torch.save(history, history_path)
-
-        if best_validation and os.path.exists(best_model_path):
-            self.load_model(best_model_path)
-
-        plt.plot(history["loss"], color="blue", label="loss")
-        plt.plot(history["train_val_loss"], color="green", label="train_val_loss")
-        plt.plot(history["val_loss"], color="orange", label="val_loss")
-        plt.yscale("log")
-        plt.legend()
-        plt.show()
-
-    def predict(self, x):
-        """
-        Run the model on a batch of input images.
-
-        Parameters
-        ----------
-        x : array_like or torch.Tensor
-            Input images in (N, H, W) or (N, H, W, C) layout.
-
-        Returns
-        -------
-        numpy.ndarray
-            Predicted images in (N, H, W, C) layout, also cached as
-            `self.yt`.
-        """
-        self.model.eval()
-        x_t = self._to_nchw(x).to(self.device)
-        with torch.no_grad():
-            pred = self.model(x_t)
-        self.yt = pred.permute(0, 2, 3, 1).cpu().numpy()
-        return self.yt
-
-    def fft(self, img):
-        """
-        Compute the centered 2D FFT of an image.
-
-        Parameters
-        ----------
-        img : numpy.ndarray
-            2D input image.
-
-        Returns
-        -------
-        numpy.ndarray
-            Complex-valued, zero-frequency-centered 2D FFT of `img`.
-        """
-        F_ = np.fft.fft2(img)
-        return np.fft.fftshift(F_)
-
-    def ifft(self, img):
-        """
-        Compute the real part of the inverse 2D FFT of a centered spectrum.
-
-        Parameters
-        ----------
-        img : numpy.ndarray
-            Zero-frequency-centered 2D Fourier spectrum.
-
-        Returns
-        -------
-        numpy.ndarray
-            Real-valued reconstructed 2D image.
-        """
-        G = np.fft.ifftshift(img)
-        return np.fft.ifft2(G).real
-
-    def fft_mask(self, img, d, apix):
-        """
-        Build a circular low-pass binary mask in frequency space
-        corresponding to a real-space resolution cutoff.
-
-        Parameters
-        ----------
-        img : numpy.ndarray
-            2D reference image used only for its shape.
-        d : float
-            Desired real-space resolution cutoff (same length units as
-            `apix`).
-        apix : float
-            Pixel size (length units per pixel).
-
-        Returns
-        -------
-        numpy.ndarray
-            Binary mask of the same shape as `img`, 1 inside the cutoff
-            radius and 0 outside.
-        """
-        M, N = img.shape
-        nyquist = N / 2
-        D0 = nyquist * apix / d
-        uu, vv = np.meshgrid(np.arange(M), np.arange(N), indexing="ij")
-        D = np.sqrt((uu - M / 2) ** 2 + (vv - N / 2) ** 2)
-        return (D <= D0).astype(np.float32)
-
-    def low_pass(self, image, d, apix):
-        """
-        Apply a circular low-pass filter to an image in Fourier space.
-
-        Parameters
-        ----------
-        image : array_like
-            Input image, optionally with a singleton channel dimension.
-        d : float
-            Desired real-space resolution cutoff.
-        apix : float
-            Pixel size (length units per pixel).
-
-        Returns
-        -------
-        numpy.ndarray
-            Low-pass filtered 2D image.
-        """
-        img = np.asarray(image).copy()
-        if img.ndim > 2:
-            img = img.squeeze()
-        F_ = self.fft(img)
-        mask = self.fft_mask(img, d, apix)
-        return self.ifft(F_ * mask)
-    
-    def _np(self, x):
-        """
-        Convert a tensor or array-like object to a NumPy array.
-
-        Parameters
-        ----------
-        x : torch.Tensor or array_like
-            Input data.
-
-        Returns
-        -------
-        numpy.ndarray
-            NumPy array view/copy of the input.
-        """
-        if torch.is_tensor(x):
-            return x.cpu().numpy()
-        return np.asarray(x)
-    
-    def im_compare(self, sample_num=5, columns=4, d=15, apix=5, length=12, height=0.85):
-        """
-        Visually compare random training samples against model predictions
-        and a low-pass-filtered reference.
-
-        Parameters
-        ----------
-        sample_num : int, optional
-            Number of random training samples to display, by default 5.
-        columns : int, optional
-            Number of subplot columns per sample (input, target, prediction,
-            low-pass reference), by default 4.
-        d : float, optional
-            Resolution cutoff passed to `low_pass`, by default 15.
-        apix : float, optional
-            Pixel size passed to `low_pass`, by default 5.
-        length : float, optional
-            Figure width in inches, by default 12.
-        height : float, optional
-            Figure height in inches, by default 0.85.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        Only the "Train" set is currently displayed; validation and test
-        comparisons are computed but not plotted.
-        """
-        nums_train = random.sample(range(len(self.train_ids)), sample_num)
-        nums_val   = random.sample(range(len(self.train_val_ids)), sample_num)
-        nums_test  = random.sample(range(len(self.test_ids)), sample_num)
-
-        train_sample_X = self._np(self.train_X)[nums_train]
-        val_sample_X   = self._np(self.val_X)[nums_val]
-        test_sample_X  = self._np(self.test_X)[nums_test]
-        train_sample_y = self._np(self.train_y)[nums_train]
-        val_sample_y   = self._np(self.val_y)[nums_val]
-        test_sample_y  = self._np(self.test_y)[nums_test]
-
-        predict_train = self.predict(train_sample_X)
-        predict_val   = self.predict(val_sample_X)
-        predict_test  = self.predict(test_sample_X)
-
-        new_line = "\n"
-        sets = [
-            ("Train", nums_train, train_sample_X, train_sample_y, predict_train),
-            #("Val", nums_val, val_sample_X, val_sample_y, predict_val),
-            #("Test", nums_test, test_sample_X, test_sample_y, predict_test),
-        ]
-
-        for label, nums, sample_X, sample_y, predict in sets:
-            for i in range(sample_num):
-                fig, ax = plt.subplots(1, columns, figsize=(length, height))
-                ax[0].imshow(sample_X[i], origin="lower"); ax[0].axis('off')
-                ax[0].set_title(f"{label} x {nums[i]}")
-                ax[1].imshow(sample_y[i], origin="lower"); ax[1].axis('off')
-                ax[1].set_title(f"{label} y {nums[i]}")
-                ax[2].imshow(predict[i], origin="lower"); ax[2].axis('off')
-                ax[2].set_title(f"Predict {label} y {new_line} from {label} x")
-                ax[3].imshow(self.low_pass(sample_X[i], d, apix), origin="lower"); ax[3].axis('off')
-                ax[3].set_title(f"Low Pass {new_line} {label} y")
-                plt.show()
-                plt.close()
 
 def window_partition(x, window_size):
     """
@@ -1609,7 +992,7 @@ class SwinStage(nn.Module):
 class SwinDenoiser(nn.Module):
     def __init__(
             self, img_size=32, channels=1, patch_size=4, dim=192,
-            depth=6, num_heads=6, window_size=4, mlp_ratio=4.0, dropout=0.0):
+            depth=6, num_heads=6, window_size=4, mlp_ratio=4.0, dropout=0.0, use_x_skip=False):
         """
         A Swin Transformer-based image denoiser: splits the image into patches,
         processes them through a stack of `SwinStage` blocks with windowed
@@ -1648,6 +1031,8 @@ class SwinDenoiser(nn.Module):
         self.grid = img_size // patch_size
         num_patches = self.grid**2
         patch_dim = channels*patch_size*patch_size
+        self.use_x_skip = use_x_skip
+        print(f"Swin - use X skip: {use_x_skip}")
 
         assert self.grid % window_size == 0 or window_size >= self.grid, \
             f"window_size ({window_size}) should divide grid ({self.grid}) evenly"
@@ -1663,6 +1048,13 @@ class SwinDenoiser(nn.Module):
         ])
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, patch_dim)
+
+        if self.use_x_skip:
+            self.x_skip_conv = nn.Sequential(
+                nn.Conv2d(channels*2, channels*2, 3, padding="same"),
+                nn.ReLU(),
+                nn.Conv2d(channels*2, channels, 3, padding="same"),
+            )
 
     def _patchify(self, x):
         """
@@ -1726,6 +1118,7 @@ class SwinDenoiser(nn.Module):
         ValueError
             If the input spatial dimensions don't match `img_size`.
         """
+        inp = x
         b, c, h, w = x.shape
         if h != self.img_size or w != self.img_size:
             raise ValueError(
@@ -1735,7 +1128,12 @@ class SwinDenoiser(nn.Module):
             tokens = stage(tokens)
         tokens = self.norm(tokens)
         patches_out = self.head(tokens)
-        return self._unpatchify(patches_out, b)
+        out = self._unpatchify(patches_out, b)
+
+        if self.use_x_skip:
+            out = self.x_skip_conv(torch.cat([out, inp], dim=1))
+
+        return out
 
 MODEL_REGISTRY = {
     "n2n": N2N,
@@ -1744,3 +1142,677 @@ MODEL_REGISTRY = {
     "attn_unet": AttnUNet,
     "swin": SwinDenoiser
 }
+
+class Denoiser:
+    def __init__(self, name="Denoiser", device="cpu"):
+        """
+        High-level training/evaluation wrapper around the denoiser
+        architectures in `MODEL_REGISTRY`, handling dataset splitting, model
+        construction, training with masked loss, checkpointing, prediction, and
+        visualization.
+
+        Parameters
+        ----------
+        name : str, optional
+            Name used for logging and checkpoint filenames, by default
+            "Denoiser".
+        device : str, optional
+            Torch device string (e.g. "cpu" or "cuda") to run the model on, by
+            default "cpu".
+        """
+        self.name = name
+        self.device = torch.device(device)
+        self.model = None
+
+    def set_dataset(self, data):
+        """
+        Attach a dataset object providing paired AFM crops to the wrapper.
+
+        Parameters
+        ----------
+        data : object
+            Dataset object exposing `cuts_num`, `x_cuts`/`x_norm`,
+            `y_cuts`/`y_norm`, `mx_cuts`, `my_cuts`, and optionally
+            `crop_w`, `crop_h`, `channels`.
+
+        Returns
+        -------
+        None
+        """
+        self.dataset = data
+
+    def split(self, fractions=(0.7, 0.2, 0.1), norm=False, seed=None):
+        """
+        Randomly split the attached dataset into train, train-validation,
+        and test subsets, and construct a reversed-direction (Y -> X)
+        validation set from the train-validation crops.
+
+        Parameters
+        ----------
+        fractions : tuple of float, optional
+            Approximate (train, train_val, test) fractions of the dataset,
+            by default (0.7, 0.2, 0.1). The test fraction is implied by the
+            remainder.
+        norm : bool, optional
+            If True, use the dataset's normalized arrays (`x_norm`,
+            `y_norm`) instead of the raw arrays, by default False.
+        seed : int or None, optional
+            Random seed for reproducible splits, by default None.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Populates `self.train_X/y/MX/My`, `self.train_val_X/y/MX/My`,
+        `self.val_X/y/MX/My` (built by swapping X and Y on the
+        train-validation crops), and `self.test_X/y/MX/My`, along with the
+        corresponding id lists.
+        """
+        n = self.dataset.cuts_num
+        train_size, train_val_size, _ = (np.array(fractions)*n).astype(int)
+        train_i, train_val_i = train_size, train_size + train_val_size
+        train_val_i = min(n, train_val_i)
+
+        ids = list(range(n))
+        random.Random(seed).shuffle(ids)
+        #random.shuffle(ids)
+        self.train_ids = ids[0:train_i]
+        self.train_val_ids = ids[train_i:train_val_i]
+        self.test_ids = ids[train_val_i:n]
+
+        self.norm = norm
+        x = self.dataset.x_cuts if not norm else self.dataset.x_norm
+        y = self.dataset.y_cuts if not norm else self.dataset.y_norm
+        mx = self.dataset.mx_cuts
+        my = self.dataset.my_cuts
+
+        self.train_X  = x[self.train_ids]
+        self.train_y  = y[self.train_ids]
+        self.train_MX = mx[self.train_ids]
+        self.train_My = my[self.train_ids]
+
+        # same-direction held-out set (X -> Y), for monitoring
+        self.train_val_X  = x[self.train_val_ids]
+        self.train_val_y  = y[self.train_val_ids]
+        self.train_val_MX = mx[self.train_val_ids]
+        self.train_val_My = my[self.train_val_ids]
+
+        # real validation: reversed direction (Y -> X) on the SAME crops
+        self.val_X  = y[self.train_val_ids]
+        self.val_y  = x[self.train_val_ids]
+        self.val_MX = my[self.train_val_ids]
+        self.val_My = mx[self.train_val_ids]
+
+        self.test_X  = x[self.test_ids]
+        self.test_y  = y[self.test_ids]
+        self.test_MX = mx[self.test_ids]
+        self.test_My = my[self.test_ids]
+
+    def build_model(
+            self, arch="unet", width=None, height=None, channels=None,
+            lr=1e-3, loss="mse", summary=False, use_x_skip=False, **model_kwargs):
+        """
+        Construct the underlying denoiser model, loss function, and
+        optimizer.
+
+        Parameters
+        ----------
+        arch : str, optional
+            Architecture name, one of the keys in `MODEL_REGISTRY`
+            ("n2n", "unet", "vit", "attn_unet", "swin"), by default "unet".
+        width : int or None, optional
+            Expected crop width. If None, inferred from the attached
+            dataset's `crop_w`, falling back to 32, by default None.
+        height : int or None, optional
+            Expected crop height. If None, inferred from the attached
+            dataset's `crop_h`, falling back to 32, by default None.
+        channels : int or None, optional
+            Number of image channels. If None, inferred from the attached
+            dataset's `channels`, falling back to 1, by default None.
+        lr : float, optional
+            Learning rate for the Adam optimizer, by default 1e-3.
+        loss : {"mse", "mae"} or callable, optional
+            Loss function to use (elementwise, reduction="none"), or a
+            custom callable, by default "mse".
+        summary : bool, optional
+            If True, print the full model architecture, by default False.
+        **model_kwargs
+            Additional keyword arguments forwarded to the model
+            constructor.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If `arch` is not a key in `MODEL_REGISTRY`.
+        AssertionError
+            If `arch` requires square crops (n2n, vit, swin) and
+            `width != height`.
+        """
+        if arch not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown arch '{arch}'. Options: {list(MODEL_REGISTRY)}")
+
+        if hasattr(self, "dataset"):
+            width = width or getattr(self.dataset, "crop_w", None)
+            height = height or getattr(self.dataset, "crop_h", None)
+            channels = channels or getattr(self.dataset, "channels", None)
+        width = width or 32
+        height = height or 32
+        channels = channels or 1
+
+        if arch in ["n2n", "vit", "swin"]:
+            assert width == height, f"{arch} Denoiser currently assumes square crops"
+            model_kwargs.setdefault("img_size", width)
+        model_kwargs.setdefault("channels", channels)
+        if arch not in ["n2n"]:
+            model_kwargs.setdefault("use_x_skip", use_x_skip)
+            print(f"Using skip +X: {use_x_skip}")
+
+        self.arch = arch
+        self.model = MODEL_REGISTRY[arch](**model_kwargs).to(self.device)
+
+        self.loss_fn = {
+            "mse": nn.MSELoss(reduction='none'),
+            "mae": nn.L1Loss(reduction='none')}[loss] if isinstance(loss, str) else loss
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        n_params = sum(p.numel() for p in self.model.parameters())
+        print(f"{self.name} ({arch}) built with {n_params:,} parameters.")
+        if summary:
+            print(self.model)
+
+    @staticmethod
+    def _to_nchw(x):
+        """
+        Convert an array/tensor in (N, H, W) or (N, H, W, C) layout to
+        (N, C, H, W) float tensor layout.
+
+        Parameters
+        ----------
+        x : array_like or torch.Tensor
+            Input batch of images.
+
+        Returns
+        -------
+        torch.Tensor
+            Float tensor of shape (N, C, H, W).
+        """
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        x = x.float()
+        if x.ndim == 3:
+            x = x.unsqueeze(1) # (N, H, W) -> (N, 1, H, W)
+        elif x.ndim == 4:
+            x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
+        return x
+
+    def _make_loader(self, X, Y, batch_size, shuffle, augment=False, MX=None, MY=None):
+        """
+        Build a DataLoader over paired input/target images and masks.
+
+        Parameters
+        ----------
+        X : array_like or torch.Tensor
+            Input images.
+        Y : array_like or torch.Tensor
+            Target images.
+        batch_size : int
+            Batch size for the DataLoader.
+        shuffle : bool
+            Whether to shuffle samples each epoch.
+        augment : bool, optional
+            If True, wrap the data in an `AFMPairDataset` with random
+            flip/rotation augmentation, by default False.
+        MX : array_like or torch.Tensor or None, optional
+            Mask corresponding to `X`. If None (together with `MY`), an
+            all-ones mask is used, by default None.
+        MY : array_like or torch.Tensor or None, optional
+            Mask corresponding to `Y`. If None (together with `MX`), an
+            all-ones mask is used, by default None.
+
+        Returns
+        -------
+        torch.utils.data.DataLoader
+            DataLoader yielding `(x, y, mx, my)` batches.
+        """
+        X = self._to_nchw(X)
+        Y = self._to_nchw(Y)
+
+        has_masks = (MX is not None) and (MY is not None)
+        if has_masks:
+            MX = self._to_nchw(MX).float()
+            MY = self._to_nchw(MY).float()
+        else:
+            MX = torch.ones_like(X).float()
+            MY = torch.ones_like(X).float()
+
+        if augment:
+            ds = AFMPairDataset(X, Y, mx_cuts=MX, my_cuts=MY, augment=True)
+        else: ds = torch.utils.data.TensorDataset(X, Y, MX, MY)
+        return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
+    
+    def _checkpoint_payload(self):
+        """
+        Assemble the dictionary saved to a model checkpoint.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys "model_state_dict", "norm_x_min",
+            "norm_scale", and "use_affine", reflecting the current model
+            and (if `self.norm` is True) the dataset's normalization
+            parameters.
+        """
+        return {
+            "model_state_dict": self.model.state_dict(),
+            "norm_x_min": self.dataset.norm_x_min if self.norm else 0.,
+            "norm_scale": self.dataset.norm_scale if self.norm else 1.,
+            "use_affine": getattr(self, "use_affine", None),
+        }
+
+    def load_model(self, path, map_location=None):
+        """
+        Load model weights (and, if present, normalization statistics)
+        from a checkpoint file.
+
+        Parameters
+        ----------
+        path : str
+            Path to the checkpoint file.
+        map_location : str or torch.device or None, optional
+            Device mapping passed to `torch.load`. Defaults to
+            `self.device` if None, by default None.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        If the checkpoint does not contain a "model_state_dict" key, it is
+        assumed to be a raw state dict, which is loaded directly; a warning
+        is printed that normalization statistics must be supplied manually.
+        """
+        map_location = map_location or self.device
+        checkpoint = torch.load(path, map_location=map_location)
+
+        if "model_state_dict" not in checkpoint:
+            self.model.load_state_dict(checkpoint)
+            print("Warning: no norm stats found in checkpoint, you must supply them manually.")
+            return None
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.norm_x_min = checkpoint["norm_x_min"]
+        self.norm_scale = checkpoint["norm_scale"]
+
+        norm = (self.norm_x_min, self.norm_scale)
+        print(f"Loaded checkpoint from {path}")
+        print(f"-> norm_x_min: {self.norm_x_min}")
+        print(f"-> norm_scale: {self.norm_scale}")
+
+    def train(
+            self, epochs=50, batch_size=32, v=1, best_validation=True,
+            patience=None, augment=False, monitor="val_loss", output=".", save_at_each=None):
+        """
+        Train the model with a masked reconstruction loss, tracking
+        training, same-direction validation, and reversed-direction
+        validation losses, with optional early stopping and checkpointing.
+
+        Parameters
+        ----------
+        epochs : int, optional
+            Maximum number of training epochs, by default 50.
+        batch_size : int, optional
+            Batch size used for training and evaluation, by default 32.
+        v : int, optional
+            Verbosity level: 0 for silent, 1 for per-epoch progress, >1 for
+            per-batch progress bars, by default 1.
+        best_validation : bool, optional
+            If True, reload the best checkpoint (by `monitor`) at the end
+            of training, by default True.
+        patience : int or None, optional
+            Number of epochs without improvement in `monitor` after which
+            training stops early. If None, no early stopping is applied, by
+            default None.
+        augment : bool, optional
+            If True, apply random flip/rotation augmentation to the
+            training set, by default False.
+        monitor : {"val_loss", "train_val_loss", "train_loss"}, optional
+            Metric used to select the best checkpoint and for early
+            stopping, by default "val_loss".
+        output : str, optional
+            Directory in which to save the best model checkpoint and
+            training history, by default ".".
+        save_at_each : int, optional
+            Store model weights at each given number of epochs, by default
+            None.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        The masked loss is computed as `loss_fn(pred, target) * (1 - mask)`,
+        averaged over all elements, so masked-out regions (mask == 1) are
+        excluded. Saves `{output}/{self.name}.pt` (best checkpoint) and
+        `{output}/history.pt` (loss history), and displays a plot of the
+        training/validation loss curves on a log scale.
+        """
+        assert monitor in ("val_loss", "train_val_loss", "train_loss"), \
+            "monitor must be 'val_loss' or 'train_val_loss'"
+
+        if not os.path.exists(output):
+            os.makedirs(output, exist_ok=True)
+        best_model_path = f"{output}/{self.name}.pt"
+        history_path = f"{output}/{self.name}_history.pt"
+
+        train_loader = self._make_loader(
+            self.train_X, self.train_y, batch_size, shuffle=True,
+            augment=augment, MX=self.train_MX, MY=self.train_My)
+        train_val_loader = self._make_loader(
+            self.train_val_X, self.train_val_y, batch_size, shuffle=False,
+            augment=False, MX=self.train_val_MX, MY=self.train_val_My)
+        val_loader = self._make_loader(
+            self.val_X, self.val_y, batch_size, shuffle=False,
+            augment=False, MX=self.val_MX, MY=self.val_My)
+
+        history = {"loss": [], "train_val_loss": [], "val_loss": []}
+        best_monitored_loss = float("inf")
+        epochs_no_improve = 0
+
+        def _eval(loader):
+            self.model.eval()
+            running, n_seen = 0.0, 0
+            with torch.no_grad():
+                for xb, yb, mxb, myb in loader:
+                    xb, yb = xb.to(self.device), yb.to(self.device)
+                    mxb, myb = mxb.to(self.device), myb.to(self.device)
+                    pred = self.model(xb)
+                    loss = (self.loss_fn(pred, yb)*(1 - myb)).mean()
+                    running += loss.item() * xb.size(0)
+                    n_seen += xb.size(0)
+            return running / max(n_seen, 1)
+
+        for epoch in range(epochs):
+            self.model.train()
+            running_loss = 0.0
+            n_seen = 0
+            n_batches = len(train_loader)
+            bar_len = 30
+
+            for batch_idx, (xb, yb, mxb, myb) in enumerate(train_loader):
+                xb, yb = xb.to(self.device), yb.to(self.device)
+                mxb, myb = mxb.to(self.device), myb.to(self.device)
+
+                self.optimizer.zero_grad()
+                pred = self.model(xb)
+                loss = (self.loss_fn(pred, yb)*(1 - myb)).mean()
+                loss.backward()
+                self.optimizer.step()
+
+                batch_loss = loss.item()
+                running_loss += batch_loss*xb.size(0)
+                n_seen += xb.size(0)
+
+                if v > 1:
+                    frac = (batch_idx + 1)/n_batches
+                    filled = int(bar_len*frac)
+                    bar = "#"*filled + "-"*(bar_len - filled)
+                    print(f"\rEpoch {epoch + 1}/{epochs} [{bar}] "
+                        f"batch {batch_idx + 1}/{n_batches} "
+                        f"- batch_loss: {batch_loss:.6f}", end="", flush=True)
+
+            train_loss = running_loss/max(n_seen, 1)
+            train_val_loss = _eval(train_val_loader)
+            val_loss = _eval(val_loader)
+
+            history["loss"].append(train_loss)
+            history["train_val_loss"].append(train_val_loss)
+            history["val_loss"].append(val_loss)
+
+            monitored = None
+            if monitor == "train_val_loss": monitored = train_val_loss
+            if monitor == "val_loss":       monitored = val_loss
+            if monitor == "train_loss":     monitored = train_loss
+
+            if monitored < best_monitored_loss:
+                best_monitored_loss = monitored
+                epochs_no_improve = 0
+                torch.save(self._checkpoint_payload(), best_model_path)
+            else: epochs_no_improve += 1
+
+            if save_at_each and (epoch + 1) % save_at_each == 0:
+                mname_i = f"{output}/model_at_{epoch}.pt"
+                torch.save(self._checkpoint_payload(), mname_i)
+
+            if v > 1:
+                epoch_frac = (epoch + 1)/epochs
+                epoch_filled = int(bar_len*epoch_frac)
+                epoch_bar = "#"*epoch_filled + "-"*(bar_len - epoch_filled)
+                add_best = " (*)" if not epochs_no_improve else ""
+                print(
+                    f"\rEpoch {epoch + 1}/{epochs} [{epoch_bar}] loss: {train_loss:.6f} "
+                    f"- train_val_loss: {train_val_loss:.6f} "
+                    f"- val_loss: {val_loss:.6f}{add_best}" + " "*15)
+            if v == 1:
+                frac = (epoch + 1)/epochs
+                filled = int(bar_len*frac)
+                bar = "#"*filled + "-"*(bar_len - filled)
+                print(f"\rEpoch [{bar}] {epoch + 1}/{epochs}", end="", flush=True)
+
+            if patience is not None and epochs_no_improve >= patience:
+                print()
+                print(f"Early stopping: no improvement in {monitor} for "
+                    f"{patience} epochs (best {monitor}: {best_monitored_loss:.6f})")
+                break
+        self.history = history
+        torch.save(history, history_path)
+
+        if best_validation and os.path.exists(best_model_path):
+            self.load_model(best_model_path)
+
+        plt.plot(history["loss"], color="blue", label="loss")
+        plt.plot(history["train_val_loss"], color="green", label="train_val_loss")
+        plt.plot(history["val_loss"], color="orange", label="val_loss")
+        plt.yscale("log")
+        plt.legend()
+        plt.show()
+
+    def predict(self, x):
+        """
+        Run the model on a batch of input images.
+
+        Parameters
+        ----------
+        x : array_like or torch.Tensor
+            Input images in (N, H, W) or (N, H, W, C) layout.
+
+        Returns
+        -------
+        numpy.ndarray
+            Predicted images in (N, H, W, C) layout, also cached as
+            `self.yt`.
+        """
+        self.model.eval()
+        x_t = self._to_nchw(x).to(self.device)
+        with torch.no_grad():
+            pred = self.model(x_t)
+        self.yt = pred.permute(0, 2, 3, 1).cpu().numpy()
+        return self.yt
+
+    def fft(self, img):
+        """
+        Compute the centered 2D FFT of an image.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            2D input image.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex-valued, zero-frequency-centered 2D FFT of `img`.
+        """
+        F_ = np.fft.fft2(img)
+        return np.fft.fftshift(F_)
+
+    def ifft(self, img):
+        """
+        Compute the real part of the inverse 2D FFT of a centered spectrum.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            Zero-frequency-centered 2D Fourier spectrum.
+
+        Returns
+        -------
+        numpy.ndarray
+            Real-valued reconstructed 2D image.
+        """
+        G = np.fft.ifftshift(img)
+        return np.fft.ifft2(G).real
+
+    def fft_mask(self, img, d, apix):
+        """
+        Build a circular low-pass binary mask in frequency space
+        corresponding to a real-space resolution cutoff.
+
+        Parameters
+        ----------
+        img : numpy.ndarray
+            2D reference image used only for its shape.
+        d : float
+            Desired real-space resolution cutoff (same length units as
+            `apix`).
+        apix : float
+            Pixel size (length units per pixel).
+
+        Returns
+        -------
+        numpy.ndarray
+            Binary mask of the same shape as `img`, 1 inside the cutoff
+            radius and 0 outside.
+        """
+        M, N = img.shape
+        nyquist = N / 2
+        D0 = nyquist * apix / d
+        uu, vv = np.meshgrid(np.arange(M), np.arange(N), indexing="ij")
+        D = np.sqrt((uu - M / 2) ** 2 + (vv - N / 2) ** 2)
+        return (D <= D0).astype(np.float32)
+
+    def low_pass(self, image, d, apix):
+        """
+        Apply a circular low-pass filter to an image in Fourier space.
+
+        Parameters
+        ----------
+        image : array_like
+            Input image, optionally with a singleton channel dimension.
+        d : float
+            Desired real-space resolution cutoff.
+        apix : float
+            Pixel size (length units per pixel).
+
+        Returns
+        -------
+        numpy.ndarray
+            Low-pass filtered 2D image.
+        """
+        img = np.asarray(image).copy()
+        if img.ndim > 2:
+            img = img.squeeze()
+        F_ = self.fft(img)
+        mask = self.fft_mask(img, d, apix)
+        return self.ifft(F_ * mask)
+    
+    def _np(self, x):
+        """
+        Convert a tensor or array-like object to a NumPy array.
+
+        Parameters
+        ----------
+        x : torch.Tensor or array_like
+            Input data.
+
+        Returns
+        -------
+        numpy.ndarray
+            NumPy array view/copy of the input.
+        """
+        if torch.is_tensor(x):
+            return x.cpu().numpy()
+        return np.asarray(x)
+    
+    def im_compare(self, sample_num=5, columns=4, d=15, apix=5, length=12, height=0.85):
+        """
+        Visually compare random training samples against model predictions
+        and a low-pass-filtered reference.
+
+        Parameters
+        ----------
+        sample_num : int, optional
+            Number of random training samples to display, by default 5.
+        columns : int, optional
+            Number of subplot columns per sample (input, target, prediction,
+            low-pass reference), by default 4.
+        d : float, optional
+            Resolution cutoff passed to `low_pass`, by default 15.
+        apix : float, optional
+            Pixel size passed to `low_pass`, by default 5.
+        length : float, optional
+            Figure width in inches, by default 12.
+        height : float, optional
+            Figure height in inches, by default 0.85.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        Only the "Train" set is currently displayed; validation and test
+        comparisons are computed but not plotted.
+        """
+        nums_train = random.sample(range(len(self.train_ids)), sample_num)
+        nums_val   = random.sample(range(len(self.train_val_ids)), sample_num)
+        nums_test  = random.sample(range(len(self.test_ids)), sample_num)
+
+        train_sample_X = self._np(self.train_X)[nums_train]
+        val_sample_X   = self._np(self.val_X)[nums_val]
+        test_sample_X  = self._np(self.test_X)[nums_test]
+        train_sample_y = self._np(self.train_y)[nums_train]
+        val_sample_y   = self._np(self.val_y)[nums_val]
+        test_sample_y  = self._np(self.test_y)[nums_test]
+
+        predict_train = self.predict(train_sample_X)
+        predict_val   = self.predict(val_sample_X)
+        predict_test  = self.predict(test_sample_X)
+
+        new_line = "\n"
+        sets = [
+            ("Train", nums_train, train_sample_X, train_sample_y, predict_train),
+            #("Val", nums_val, val_sample_X, val_sample_y, predict_val),
+            #("Test", nums_test, test_sample_X, test_sample_y, predict_test),
+        ]
+
+        for label, nums, sample_X, sample_y, predict in sets:
+            for i in range(sample_num):
+                fig, ax = plt.subplots(1, columns, figsize=(length, height))
+                ax[0].imshow(sample_X[i], origin="lower"); ax[0].axis('off')
+                ax[0].set_title(f"{label} x {nums[i]}")
+                ax[1].imshow(sample_y[i], origin="lower"); ax[1].axis('off')
+                ax[1].set_title(f"{label} y {nums[i]}")
+                ax[2].imshow(predict[i], origin="lower"); ax[2].axis('off')
+                ax[2].set_title(f"Predict {label} y {new_line} from {label} x")
+                ax[3].imshow(self.low_pass(sample_X[i], d, apix), origin="lower"); ax[3].axis('off')
+                ax[3].set_title(f"Low Pass {new_line} {label} y")
+                plt.show()
+                plt.close()
