@@ -378,8 +378,8 @@ def plot_stripe_boxes_diagnostic(
     axes[1].set_title(f'{len(pos_boxes)} pos / {len(neg_boxes)} neg segments  ({masked_pct:.2f}% masked)')
     axes[1].axis('off')
 
-    plt.savefig(f"{output}/stripe_masking.pdf", dpi=600)
     plt.tight_layout()
+    plt.savefig(f"{output}/stripe_masking.pdf", dpi=600)
     plt.show()
 
     return fig, axes, combined_mask, pos_mask, neg_mask, residual
