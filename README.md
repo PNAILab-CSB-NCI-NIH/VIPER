@@ -40,7 +40,7 @@ conda activate viper
 ### 3. Install requirements
 ```bash
 # Install requirements
-pip install -r requirements
+pip install -r requirements.txt
 ```
 
 ### 4. Include Kernel into Jupyter
