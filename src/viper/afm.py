@@ -35,7 +35,7 @@ class AFMImage():
         if path is not None:
             self.read_path(path, unit)
         if tensor is not None:
-            self.read_tensor(tensor)
+            self.read_tensor(tensor, apix, unit)
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
