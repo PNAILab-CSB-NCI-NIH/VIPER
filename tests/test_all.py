@@ -134,6 +134,10 @@ class TestPipeline(unittest.TestCase):
         _ = ana.plot_radial_spectrum()
         _ = ana.plot_autocorrelation()
         _ = ana.plot_fft_reciprocal_lattice()
+        _ = ana.plot_fft_vs_acf(
+            title_size=22, label_size=18,
+            tick_size=16, legend_size=18
+        )
 
         if crystal_phases:
             comp = ana.compare_to_crystal_phases(crystal_phases)
