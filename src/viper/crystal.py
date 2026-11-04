@@ -54,7 +54,7 @@ class Settings:
     # Plotting
     save_figures: bool = True
     show_figures: bool = True
-    dpi: int = 300
+    dpi: int = 600
     realspace_cmap: str = "afmhot"
     fft_cmap: str = "viridis"
     acf_cmap: str = "viridis"
@@ -1752,7 +1752,7 @@ class AFMLatticeAnalysis:
         """
         if self.settings.save_figures:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            fig.savefig(self.output_dir / name, dpi=self.settings.dpi, bbox_inches="tight")
+            fig.savefig(self.output_dir/name, dpi=self.settings.dpi, bbox_inches="tight")
         if self.settings.show_figures:
             plt.show(block=False)
         else: plt.close(fig)
@@ -1783,7 +1783,7 @@ class AFMLatticeAnalysis:
         ax.set_xlabel("X (nm)"); ax.set_ylabel("Y (nm)")
         ax.set_title(f"{self.data_label}: real space")
         fig.colorbar(im, ax=ax, label="Z")
-        self._save_fig(fig, "01_real_space.png")
+        self._save_fig(fig, "01_real_space.pdf")
         self.figures["real_space"] = fig
         return fig
 
@@ -1824,7 +1824,7 @@ class AFMLatticeAnalysis:
         ax.set_xlabel("qx (cycles/nm)"); ax.set_ylabel("qy (cycles/nm)")
         ax.set_title("FFT power spectrum, log10")
         fig.colorbar(im, ax=ax, label="log10(power)")
-        self._save_fig(fig, "02_fft_power_paired_peaks.png")
+        self._save_fig(fig, "02_fft_power_paired_peaks.pdf")
         self.figures["fft"] = fig
         return fig
 
@@ -1864,7 +1864,7 @@ class AFMLatticeAnalysis:
         ax.set_ylabel("Radially averaged power")
         ax.set_title("Radially averaged FFT power spectrum")
         ax.grid(alpha=0.2)
-        self._save_fig(fig, "03_radial_spectrum_log.png")
+        self._save_fig(fig, "03_radial_spectrum_log.pdf")
         self.figures["radial_spectrum"] = fig
         return fig
 
@@ -1931,7 +1931,7 @@ class AFMLatticeAnalysis:
         ax.set_title(title)
         fig.colorbar(im, ax=ax, label="Normalized autocorrelation")
         ax.legend(loc="best")
-        self._save_fig(fig, "04_autocorrelation_data_driven_lattice.png")
+        self._save_fig(fig, "04_autocorrelation_data_driven_lattice.pdf")
         self.figures["autocorrelation"] = fig
         return fig
 
@@ -1972,7 +1972,7 @@ class AFMLatticeAnalysis:
         ax.set_title("AFM ACF basis lengths vs crystallographic a and c")
         ax.grid(alpha=0.2, axis="y")
         ax.legend(loc="best")
-        self._save_fig(fig, "05_direct_lattice_vs_crystal.png")
+        self._save_fig(fig, "05_direct_lattice_vs_crystal.pdf")
         self.figures["direct_vs_crystal"] = fig
         return fig
 
@@ -2026,8 +2026,301 @@ class AFMLatticeAnalysis:
         ax.set_title("FFT peaks vs reciprocal lattice predicted from ACF")
         ax.grid(alpha=0.15)
         ax.legend(loc="best")
-        self._save_fig(fig, "06_fft_vs_reciprocal_lattice.png")
+        self._save_fig(fig, "06_fft_vs_reciprocal_lattice.pdf")
         self.figures["fft_reciprocal_lattice"] = fig
+        return fig
+
+    def plot_fft_vs_acf(
+        self, figsize=(17, 9), title_size=18, label_size=16,
+        tick_size=13, legend_size=12, annotation_size=11,
+        filename="07_fft_vs_acf.pdf", reduced_legend=False,
+    ):
+        """Plot FFT and ACF side by side using the original class/settings.
+
+        Fit FFT peaks and ACF peaks independently, without self.lattice.
+        Both legends report their own reduced direct-cell lengths in nm
+        and acute cell angle. FFT vectors use A = inv(G).T (cycles/nm).
+        Missing fundamentals/harmonics may cause cell ambiguity; agreement
+        is not enforced. FFT and ACF from one image are related transforms,
+        so these are separate estimates, not independent experiments.
+        Text sizes are in points. Saving/display follow self.settings.
+        Set reduced_legend=True for colored direct-cell values plus only
+        fitted/paired peaks (FFT) or paired peaks/lattice (ACF).
+        """
+        if self.power is None:
+            self.run_fft()
+        if self.ac is None:
+            self.run_autocorrelation()
+
+        # Fit each source separately; never read or overwrite self.lattice.
+        s = self.settings
+        basis_colors = ("orange", "purple") if reduced_legend else ("orange", "magenta")
+
+        def reduce_basis(B):
+            """Gauss reduction with integer operations preserving the cell."""
+            B = np.array(B, dtype=float, copy=True)
+            for _ in range(64):
+                if np.dot(B[:, 1], B[:, 1]) < np.dot(B[:, 0], B[:, 0]):
+                    B = B[:, ::-1].copy()
+                mu = int(np.rint(np.dot(B[:, 0], B[:, 1])/np.dot(B[:, 0], B[:, 0])))
+                if mu == 0:
+                    break
+                B[:, 1] -= mu * B[:, 0]
+            # Use shortest first and an acute/equal angle for comparison.
+            if B[0, 0] < 0 or (abs(B[0, 0]) < 1e-12 and B[1, 0] < 0):
+                B[:, 0] *= -1
+            if np.dot(B[:, 0], B[:, 1]) < 0:
+                B[:, 1] *= -1
+            return B
+
+        def fit_source(rows, keys, strength_key, limit, scale, tol, minimum, source):
+            """Candidate search and integer-index least-squares refinement.
+
+            Residuals are measured in nm for ACF and FFT pixels for FFT.
+            Coverage rewards explained peaks; an index penalty discourages
+            arbitrarily dense lattices. This is a heuristic indexing fit:
+            missing fundamentals can leave primitive-cell ambiguity.
+            """
+            valid = [p for p in rows if np.all(np.isfinite([p[k] for k in keys]))]
+            valid.sort(key=lambda p: p.get(strength_key, 1.0), reverse=True)
+            obs = np.array([[p[k] for k in keys] for p in valid[:limit]], dtype=float)
+            if len(obs) < 2:
+                return None, "Need at least two non-collinear peak pairs"
+            obs = obs[np.linalg.norm(obs/scale, axis=1) > 1e-9]
+            if len(obs) < 2:
+                return None, "Need at least two nonzero peak pairs"
+            pool = list(obs)
+            for i in range(len(obs)):
+                for j in range(i + 1, len(obs)):
+                    pool.extend((obs[i] + obs[j], obs[i] - obs[j]))
+            pool.sort(key=lambda v: np.linalg.norm(v/scale))
+            candidates = []
+            for v in pool:
+                if np.linalg.norm(v/scale) < tol:
+                    continue  # Differences below matching resolution are unreliable.
+                if any(
+                    min(np.linalg.norm((v - u)/scale), np.linalg.norm((v + u)/scale)) < 0.25*tol
+                       for u in candidates):
+                    continue
+                candidates.append(v)
+                if len(candidates) == 60:
+                    break
+            best, best_score = None, -np.inf
+            for i, u in enumerate(candidates):
+                for v in candidates[i + 1:]:
+                    B = np.column_stack((u, v))
+                    # Reject unresolved/collinear cells in the residual metric.
+                    metric = B/scale[:, None]
+                    if abs(np.linalg.det(metric)) < 1e-8:
+                        continue
+                    sine = abs(np.linalg.det(metric)) / (
+                        np.linalg.norm(metric[:, 0]) * np.linalg.norm(metric[:, 1]))
+                    if sine < np.sin(np.radians(s.min_basis_angle_deg)):
+                        continue
+                    # Alternating integer assignments and least-squares fitting.
+                    for _ in range(4):
+                        if np.linalg.cond(B/scale[:, None]) > 1e6:
+                            break
+                        indices = np.rint(np.linalg.solve(B, obs.T).T)
+                        residual = np.linalg.norm((obs - indices@B.T)/scale, axis=1)
+                        matched = ((residual <= tol) & np.any(indices != 0, axis=1)
+                                   & (np.max(abs(indices), axis=1) <= s.max_lattice_index))
+                        if matched.sum() < 2 or np.linalg.matrix_rank(indices[matched]) < 2:
+                            break
+                        refined = np.linalg.lstsq(indices[matched], obs[matched], rcond=None)[0].T
+                        if abs(np.linalg.det(refined / scale[:, None])) < 1e-8:
+                            break
+                        B = refined
+                    else:
+                        # Score in a reduced basis to avoid arbitrary large indices.
+                        B = reduce_basis(B)
+                        indices = np.rint(np.linalg.solve(B, obs.T).T)
+                        residual = np.linalg.norm((obs - indices@B.T)/scale, axis=1)
+                        matched = ((residual <= tol) & np.any(indices != 0, axis=1)
+                                   & (np.max(abs(indices), axis=1) <= s.max_lattice_index))
+                        if matched.sum() < 2 or np.linalg.matrix_rank(indices[matched]) < 2:
+                            continue
+                        coverage = float(np.mean(matched))
+                        rms = float(np.sqrt(np.mean(residual[matched]**2)))
+                        complexity = float(np.mean(np.linalg.norm(indices[matched], axis=1)))
+                        score = coverage - 0.08*rms/tol - 0.02*complexity
+                        if score > best_score:
+                            best_score = score
+                            best = dict(
+                                basis=B, coverage=coverage, rms=rms,
+                                matched_pairs=int(matched.sum()), total_pairs=len(obs)
+                            )
+            if best is None:
+                return None, "No resolved 2D lattice found"
+            B = best.pop("basis")
+            # FFT columns are reciprocal vectors: A = inv(G).T, no 2*pi.
+            A = reduce_basis(np.linalg.inv(B).T if source == "FFT" else B)
+            best.update(
+                b1=A[:, 0], b2=A[:, 1], G=np.linalg.inv(A).T,
+                beta_deg=vector_angle(A[:, 0], A[:, 1]), source=source,
+                rms_unit="FFT pixels" if source == "FFT" else "nm"
+            )
+            status = f"{best['coverage']:.0%} of {best['total_pairs']} pairs matched"
+            if best['coverage'] < minimum:
+                status += "; LOW SUPPORT"
+            if best['matched_pairs'] == 2:
+                status += "; only two pairs: ambiguous cell"
+            best["status"] = status
+            return best, status
+
+        dq = np.array([abs(np.mean(np.diff(self.fx))), abs(np.mean(np.diff(self.fy)))])
+        fft_lattice, fft_status = fit_source(
+            self.paired_fft, ("qx_nm^-1", "qy_nm^-1"), "mean_amplitude",
+            s.max_fft_vectors_for_lattice, dq, s.fft_match_tol_pixels,
+            s.min_fft_coverage, "FFT",
+        )
+        acf_lattice, acf_status = fit_source(
+            self.acf_pairs, ("dx_nm", "dy_nm"), "acf_value",
+            s.max_acf_vectors_for_lattice, np.ones(2), s.acf_match_tol_nm,
+            s.min_acf_coverage, "ACF",
+        )
+        self.fft_only_lattice = fft_lattice
+        self.acf_only_lattice = acf_lattice
+        self.fft_only_lattice_status = fft_status
+        self.acf_only_lattice_status = acf_status
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+        fft_ax, acf_ax = axes
+        fft_extent = [self.fx.min(), self.fx.max(), self.fy.min(), self.fy.max()]
+        acf_extent = [self.lag_x.min(), self.lag_x.max(),
+                      self.lag_y.min(), self.lag_y.max()]
+        fft_im = fft_ax.imshow(
+            self.power_log, origin="lower", extent=fft_extent,
+            aspect="equal", cmap=s.fft_cmap,
+        )
+        acf_im = acf_ax.imshow(
+            self.ac, origin="lower", extent=acf_extent,
+            aspect="equal", cmap=s.acf_cmap,
+            vmin=np.percentile(self.ac, 1), vmax=1.0,
+        )
+
+        fitted = [p for p in self.fft_fits if p.success]
+        if fitted:
+            fft_ax.scatter(
+                [p.qx for p in fitted], [p.qy for p in fitted], s=35,
+                facecolors="none", edgecolors="black", label="fitted FFT peaks",
+            )
+        for ax, peaks, xkey, ykey, color in (
+            (fft_ax, self.paired_fft, "qx_nm^-1", "qy_nm^-1", "red"),
+            (acf_ax, self.acf_pairs, "dx_nm", "dy_nm", "red"),
+        ):
+            if peaks:
+                ax.scatter(
+                    [p[xkey] for p in peaks], [p[ykey] for p in peaks],
+                    s=65, facecolors="none", edgecolors=color,
+                    linewidths=1.2, label="paired peaks", zorder=4,
+                )
+
+        legend_titles = []
+        for ax, lattice, extent, source, status in (
+            (fft_ax, fft_lattice, fft_extent, "FFT", fft_status),
+            (acf_ax, acf_lattice, acf_extent, "ACF", acf_status),
+        ):
+            if lattice is None:
+                legend_titles.append(f"{source} only: {status}")
+                continue
+            b1, b2 = lattice["b1"], lattice["b2"]
+            legend_titles.append(
+                f"|v1|={np.linalg.norm(b1):.2f} nm, "
+                f"|v2|={np.linalg.norm(b2):.2f} nm, "
+                f"beta={lattice['beta_deg']:.2f}°"
+            )
+            basis = lattice["G"] if source == "FFT" else np.column_stack([b1, b2])
+            symbol, unit = ("g", "cycles/nm") if source == "FFT" else ("v", "nm")
+            pred = lattice_predictions(
+                basis[:, 0], basis[:, 1], s.max_lattice_index,
+                max(abs(extent[0]), abs(extent[1])),
+                max(abs(extent[2]), abs(extent[3])),
+            )
+            if pred is not None and len(pred):
+                inside = ((pred[:, 2] >= extent[0]) & (pred[:, 2] <= extent[1])
+                          & (pred[:, 3] >= extent[2]) & (pred[:, 3] <= extent[3]))
+                pred = pred[inside]
+                if source == "ACF":
+                    if len(pred):
+                        ax.scatter(pred[:, 2], pred[:, 3], marker="+", s=45,
+                                color="black", linewidths=1,
+                                label=f"{source}-only lattice", zorder=3)
+            for i, color in enumerate(basis_colors):
+                v = basis[:, i]
+                ax.plot([0, v[0]], [0, v[1]], color=color, lw=2.4,
+                        label=f"{symbol}{i + 1}={np.linalg.norm(v):.3f} {unit}",
+                        zorder=5)
+                ax.scatter(v[0], v[1], color=color, s=40, zorder=5)
+
+        for ax, extent, title, xlabel, ylabel, legend_title in zip(
+            axes, (fft_extent, acf_extent),
+            ("FFT power spectrum (log10)", "2D autocorrelation"),
+            ("qx (cycles/nm)", "Delta X (nm)"),
+            ("qy (cycles/nm)", "Delta Y (nm)"), legend_titles,
+        ):
+            ax.set_xlim(extent[:2])
+            ax.set_ylim(extent[2:])
+            ax.axhline(0, lw=0.5, color="white", alpha=0.3)
+            ax.axvline(0, lw=0.5, color="white", alpha=0.3)
+            missing = fft_lattice is None if ax is fft_ax else acf_lattice is None
+            ax.set_title(title + ("\nNo 2D lattice: see status below" if missing else ""),
+                         fontsize=title_size)
+            ax.set_xlabel(xlabel, fontsize=label_size)
+            ax.set_ylabel(ylabel, fontsize=label_size)
+            ax.tick_params(axis="both", which="both", labelsize=tick_size)
+            ax.xaxis.get_offset_text().set_fontsize(tick_size)
+            ax.yaxis.get_offset_text().set_fontsize(tick_size)
+            handles, labels = ax.get_legend_handles_labels()
+            if reduced_legend:
+                # Filter legend entries only; keep all plotted artists visible.
+                wanted = (("fitted FFT peaks", "paired peaks") if ax is fft_ax
+                          else ("paired peaks", "ACF-only lattice"))
+                entries = {label: handle for handle, label in zip(handles, labels)}
+                labels = [label for label in wanted if label in entries]
+                handles = [entries[label] for label in labels]
+                labels = [{"fitted FFT peaks": "fitted peaks",
+                           "ACF-only lattice": "ACF lattice"}.get(label, label)
+                          for label in labels]
+            if handles or (reduced_legend and not missing):
+                legend = ax.legend(
+                    handles, labels,
+                    loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2,
+                    fontsize=legend_size, title=legend_title,
+                    title_fontsize=legend_size,
+                )
+                if reduced_legend and not missing:
+                    from matplotlib.offsetbox import HPacker, TextArea
+
+                    panel_lattice = fft_lattice if ax is fft_ax else acf_lattice
+                    parts = (
+                        (f"|v1|={np.linalg.norm(panel_lattice['b1']):.2f} nm", basis_colors[0]),
+                        (", ", "black"),
+                        (f"|v2|={np.linalg.norm(panel_lattice['b2']):.2f} nm", basis_colors[1]),
+                        (f", beta={panel_lattice['beta_deg']:.2f}°", "black"),
+                    )
+                    colored_title = HPacker(
+                        children=[TextArea(text, textprops={"color": color,
+                                                          "fontsize": legend_size})
+                                  for text, color in parts],
+                        align="baseline", pad=0, sep=0,
+                    )
+                    colored_title.set_figure(fig)
+                    legend._legend_box.get_children()[0] = colored_title
+                    legend._legend_title_box = colored_title
+                    legend.stale = True
+            elif missing:
+                ax.text(0.5, -0.18, legend_title, transform=ax.transAxes,
+                        ha="center", va="top", fontsize=legend_size)
+        for ax, im, label in ((fft_ax, fft_im, "log10(power)"),
+                              (acf_ax, acf_im, "Normalized autocorrelation")):
+            cb = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.03)
+            cb.set_label(label, fontsize=label_size)
+            cb.ax.tick_params(labelsize=tick_size)
+            cb.ax.yaxis.get_offset_text().set_fontsize(tick_size)
+
+        self.figures["fft_vs_acf"] = fig
+        self._save_fig(fig, filename)
         return fig
 
     def plot_all(self):
@@ -2046,6 +2339,7 @@ class AFMLatticeAnalysis:
         self.plot_fft()
         self.plot_radial_spectrum()
         self.plot_autocorrelation()
+        self.plot_fft_vs_acf()
         if self.crystal_refs:
             self.plot_direct_vs_crystal()
         self.plot_fft_reciprocal_lattice()
