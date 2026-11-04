@@ -2033,7 +2033,7 @@ class AFMLatticeAnalysis:
     def plot_fft_vs_acf(
         self, figsize=(17, 9), title_size=18, label_size=16,
         tick_size=13, legend_size=12, annotation_size=11,
-        filename="07_fft_vs_acf.pdf",
+        filename="07_fft_vs_acf.pdf", reduced_legend=False,
     ):
         """Plot FFT and ACF side by side using the original class/settings.
 
@@ -2044,6 +2044,8 @@ class AFMLatticeAnalysis:
         is not enforced. FFT and ACF from one image are related transforms,
         so these are separate estimates, not independent experiments.
         Text sizes are in points. Saving/display follow self.settings.
+        Set reduced_legend=True for colored direct-cell values plus only
+        fitted/paired peaks (FFT) or paired peaks/lattice (ACF).
         """
         if self.power is None:
             self.run_fft()
@@ -2052,6 +2054,7 @@ class AFMLatticeAnalysis:
 
         # Fit each source separately; never read or overwrite self.lattice.
         s = self.settings
+        basis_colors = ("orange", "purple") if reduced_legend else ("orange", "magenta")
 
         def reduce_basis(B):
             """Gauss reduction with integer operations preserving the cell."""
@@ -2059,8 +2062,7 @@ class AFMLatticeAnalysis:
             for _ in range(64):
                 if np.dot(B[:, 1], B[:, 1]) < np.dot(B[:, 0], B[:, 0]):
                     B = B[:, ::-1].copy()
-                mu = int(np.rint(np.dot(B[:, 0], B[:, 1]) /
-                                 np.dot(B[:, 0], B[:, 0])))
+                mu = int(np.rint(np.dot(B[:, 0], B[:, 1])/np.dot(B[:, 0], B[:, 0])))
                 if mu == 0:
                     break
                 B[:, 1] -= mu * B[:, 0]
@@ -2084,20 +2086,20 @@ class AFMLatticeAnalysis:
             obs = np.array([[p[k] for k in keys] for p in valid[:limit]], dtype=float)
             if len(obs) < 2:
                 return None, "Need at least two non-collinear peak pairs"
-            obs = obs[np.linalg.norm(obs / scale, axis=1) > 1e-9]
+            obs = obs[np.linalg.norm(obs/scale, axis=1) > 1e-9]
             if len(obs) < 2:
                 return None, "Need at least two nonzero peak pairs"
             pool = list(obs)
             for i in range(len(obs)):
                 for j in range(i + 1, len(obs)):
                     pool.extend((obs[i] + obs[j], obs[i] - obs[j]))
-            pool.sort(key=lambda v: np.linalg.norm(v / scale))
+            pool.sort(key=lambda v: np.linalg.norm(v/scale))
             candidates = []
             for v in pool:
-                if np.linalg.norm(v / scale) < tol:
+                if np.linalg.norm(v/scale) < tol:
                     continue  # Differences below matching resolution are unreliable.
-                if any(min(np.linalg.norm((v - u) / scale),
-                           np.linalg.norm((v + u) / scale)) < 0.25 * tol
+                if any(
+                    min(np.linalg.norm((v - u)/scale), np.linalg.norm((v + u)/scale)) < 0.25*tol
                        for u in candidates):
                     continue
                 candidates.append(v)
@@ -2108,7 +2110,7 @@ class AFMLatticeAnalysis:
                 for v in candidates[i + 1:]:
                     B = np.column_stack((u, v))
                     # Reject unresolved/collinear cells in the residual metric.
-                    metric = B / scale[:, None]
+                    metric = B/scale[:, None]
                     if abs(np.linalg.det(metric)) < 1e-8:
                         continue
                     sine = abs(np.linalg.det(metric)) / (
@@ -2117,10 +2119,10 @@ class AFMLatticeAnalysis:
                         continue
                     # Alternating integer assignments and least-squares fitting.
                     for _ in range(4):
-                        if np.linalg.cond(B / scale[:, None]) > 1e6:
+                        if np.linalg.cond(B/scale[:, None]) > 1e6:
                             break
                         indices = np.rint(np.linalg.solve(B, obs.T).T)
-                        residual = np.linalg.norm((obs - indices @ B.T) / scale, axis=1)
+                        residual = np.linalg.norm((obs - indices@B.T)/scale, axis=1)
                         matched = ((residual <= tol) & np.any(indices != 0, axis=1)
                                    & (np.max(abs(indices), axis=1) <= s.max_lattice_index))
                         if matched.sum() < 2 or np.linalg.matrix_rank(indices[matched]) < 2:
@@ -2133,27 +2135,31 @@ class AFMLatticeAnalysis:
                         # Score in a reduced basis to avoid arbitrary large indices.
                         B = reduce_basis(B)
                         indices = np.rint(np.linalg.solve(B, obs.T).T)
-                        residual = np.linalg.norm((obs - indices @ B.T) / scale, axis=1)
+                        residual = np.linalg.norm((obs - indices@B.T)/scale, axis=1)
                         matched = ((residual <= tol) & np.any(indices != 0, axis=1)
                                    & (np.max(abs(indices), axis=1) <= s.max_lattice_index))
                         if matched.sum() < 2 or np.linalg.matrix_rank(indices[matched]) < 2:
                             continue
                         coverage = float(np.mean(matched))
-                        rms = float(np.sqrt(np.mean(residual[matched] ** 2)))
+                        rms = float(np.sqrt(np.mean(residual[matched]**2)))
                         complexity = float(np.mean(np.linalg.norm(indices[matched], axis=1)))
-                        score = coverage - 0.08 * rms / tol - 0.02 * complexity
+                        score = coverage - 0.08*rms/tol - 0.02*complexity
                         if score > best_score:
                             best_score = score
-                            best = dict(basis=B, coverage=coverage, rms=rms,
-                                        matched_pairs=int(matched.sum()), total_pairs=len(obs))
+                            best = dict(
+                                basis=B, coverage=coverage, rms=rms,
+                                matched_pairs=int(matched.sum()), total_pairs=len(obs)
+                            )
             if best is None:
                 return None, "No resolved 2D lattice found"
             B = best.pop("basis")
             # FFT columns are reciprocal vectors: A = inv(G).T, no 2*pi.
             A = reduce_basis(np.linalg.inv(B).T if source == "FFT" else B)
-            best.update(b1=A[:, 0], b2=A[:, 1], G=np.linalg.inv(A).T,
-                        beta_deg=vector_angle(A[:, 0], A[:, 1]), source=source,
-                        rms_unit="FFT pixels" if source == "FFT" else "nm")
+            best.update(
+                b1=A[:, 0], b2=A[:, 1], G=np.linalg.inv(A).T,
+                beta_deg=vector_angle(A[:, 0], A[:, 1]), source=source,
+                rms_unit="FFT pixels" if source == "FFT" else "nm"
+            )
             status = f"{best['coverage']:.0%} of {best['total_pairs']} pairs matched"
             if best['coverage'] < minimum:
                 status += "; LOW SUPPORT"
@@ -2240,7 +2246,7 @@ class AFMLatticeAnalysis:
                         ax.scatter(pred[:, 2], pred[:, 3], marker="+", s=45,
                                 color="black", linewidths=1,
                                 label=f"{source}-only lattice", zorder=3)
-            for i, color in enumerate(("orange", "magenta")):
+            for i, color in enumerate(basis_colors):
                 v = basis[:, i]
                 ax.plot([0, v[0]], [0, v[1]], color=color, lw=2.4,
                         label=f"{symbol}{i + 1}={np.linalg.norm(v):.3f} {unit}",
@@ -2265,12 +2271,44 @@ class AFMLatticeAnalysis:
             ax.tick_params(axis="both", which="both", labelsize=tick_size)
             ax.xaxis.get_offset_text().set_fontsize(tick_size)
             ax.yaxis.get_offset_text().set_fontsize(tick_size)
-            if ax.get_legend_handles_labels()[0]:
-                ax.legend(
+            handles, labels = ax.get_legend_handles_labels()
+            if reduced_legend:
+                # Filter legend entries only; keep all plotted artists visible.
+                wanted = (("fitted FFT peaks", "paired peaks") if ax is fft_ax
+                          else ("paired peaks", "ACF-only lattice"))
+                entries = {label: handle for handle, label in zip(handles, labels)}
+                labels = [label for label in wanted if label in entries]
+                handles = [entries[label] for label in labels]
+                labels = [{"fitted FFT peaks": "fitted peaks",
+                           "ACF-only lattice": "ACF lattice"}.get(label, label)
+                          for label in labels]
+            if handles or (reduced_legend and not missing):
+                legend = ax.legend(
+                    handles, labels,
                     loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2,
                     fontsize=legend_size, title=legend_title,
                     title_fontsize=legend_size,
                 )
+                if reduced_legend and not missing:
+                    from matplotlib.offsetbox import HPacker, TextArea
+
+                    panel_lattice = fft_lattice if ax is fft_ax else acf_lattice
+                    parts = (
+                        (f"|v1|={np.linalg.norm(panel_lattice['b1']):.2f} nm", basis_colors[0]),
+                        (", ", "black"),
+                        (f"|v2|={np.linalg.norm(panel_lattice['b2']):.2f} nm", basis_colors[1]),
+                        (f", beta={panel_lattice['beta_deg']:.2f}°", "black"),
+                    )
+                    colored_title = HPacker(
+                        children=[TextArea(text, textprops={"color": color,
+                                                          "fontsize": legend_size})
+                                  for text, color in parts],
+                        align="baseline", pad=0, sep=0,
+                    )
+                    colored_title.set_figure(fig)
+                    legend._legend_box.get_children()[0] = colored_title
+                    legend._legend_title_box = colored_title
+                    legend.stale = True
             elif missing:
                 ax.text(0.5, -0.18, legend_title, transform=ax.transAxes,
                         ha="center", va="top", fontsize=legend_size)
