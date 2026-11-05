@@ -13,8 +13,8 @@ The name stands for **self-superVised Image denoising with Paired learning and E
 
 ## Denoising Example
 
-![PLACEHOLDER: First AFM example comparing trace, retrace, and VIPER output.](docs/images/denoising-example.png)
-![PLACEHOLDER: Second AFM example comparing trace, retrace, and VIPER output.](docs/images/denoising-example2.png)
+![C2denoised_example](docs/images/denoising-example.png)
+![C1denoised_example](docs/images/denoising-example2.png)
 
 *Denoised Example, from left to right: AFM Trace, AFM Retrace, Denoised, Difference*
 
