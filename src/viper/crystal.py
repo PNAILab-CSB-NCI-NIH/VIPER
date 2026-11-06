@@ -227,7 +227,7 @@ def robust_threshold(values, sigma_mult):
     values = np.asarray(values, dtype=float)
     med = np.median(values)
     mad = np.median(np.abs(values - med))
-    sigma = 1.4826 * mad
+    sigma = 1.5 * mad
     if not np.isfinite(sigma) or sigma <= 0:
         sigma = np.std(values)
     return med + sigma_mult * sigma
