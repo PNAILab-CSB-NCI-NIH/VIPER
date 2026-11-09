@@ -13,8 +13,8 @@ The name stands for **self-superVised Image denoising with Paired learning and E
 
 ## Denoising Example
 
-![C2denoised_example](docs/images/denoising-example.png)
-![C1denoised_example](docs/images/denoising-example2.png)
+![Denoised_example1](docs/images/denoising-example.png)
+![Denoised_example2](docs/images/denoising-example2.png)
 
 *Denoised Example, from left to right: AFM Trace, AFM Retrace, Denoised, Difference*
 
